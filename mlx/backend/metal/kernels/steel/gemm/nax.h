@@ -548,8 +548,14 @@ struct NAXFrag32 {
   STEEL_CONST short kElemRows = 8;
   STEEL_CONST short kElemCols = 4;
 
-  STEEL_CONST short kElemRowsJump = 1;  // unused — per-element offsets come
-                                        // from dr/dc tables, not a stride.
+  // NAXFrag32's per-thread row layout is non-uniform (dr_table =
+  // {0,1,8,9,16,17,24,25}) — there is no valid constant stride. We set this
+  // to 1 only because NAXTile propagates the field as kFragRowsJump; do NOT
+  // use it for stride arithmetic. Callers that need per-element offsets
+  // must call dr_dc() explicitly. See Phase 5 (SDPA) of
+  // docs/superpowers/specs/2026-04-27-nax-g16-fix-plan.md for the
+  // attention path that currently uses this stride and will need rework.
+  STEEL_CONST short kElemRowsJump = 1;
 
   // One MMA produces one full 32x32 frag, i.e. unpacked.
   STEEL_CONST short kPacking = 1;
@@ -562,7 +568,7 @@ struct NAXFrag32 {
   using dtype_frag_t = typename metal::vec<U, kElemsPerFrag>;
 
   // Per-thread base coordinate in the 32x32 frag. Element i lives at
-  //   (a + dr[i % 8], b + dc[i / 8])
+  //   (b + dc[i / 8], a + dr[i % 8])  // {col, row} — matches short2 / dr_dc()
   // with
   //   a = ((lane & 1) << 1) | ((lane & 8) >> 1)        in {0, 2, 4, 6}
   //   b = ((lane & 2) >> 1) | ((lane & 4) >> 1) | ((lane & 16) >> 2)  in {0..7}
