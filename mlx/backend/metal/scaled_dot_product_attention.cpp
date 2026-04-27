@@ -837,9 +837,26 @@ bool QuantizedScaledDotProductAttention::use_fallback(
   if (has_arr_mask) {
     return true;
   }
+  // Phase 5 §6.1 routing fix. At high GQA ratios the q4 vector decode
+  // kernel's per-simdgroup dequant overhead outweighs the load-bandwidth
+  // savings of packed K/V vs fp16 K/V, and the kernel loses wall-clock
+  // to dequantize-then-fp16-SDPA at every measured context length.
+  // Phase 1 §A and Phase 4 followup data:
+  //   qwen-gqa (Hq/Hk=7): q4 loses at ctx 1024..32768 (q4/dq=1.07..1.34x)
+  //   llama3-8b (Hq/Hk=4): q4 wins at ctx >= 4096 (q4/dq=0.84..0.97x)
+  // Phase 4 attempted four kernel rewrites targeting per-simdgroup work
+  // and register pressure; none moved the bench. The kernel is at its
+  // structural ceiling for this code shape on M4 Pro. Routing-around is
+  // the cheapest user-facing fix.
+  // Threshold gqa_factor >= 5 catches qwen-style shapes (where the
+  // kernel always loses) without disturbing llama/mistral-style
+  // shapes (gqa_factor=4) where the kernel wins at long context.
+  const int gqa_factor = q.shape(1) / q_keys.shape(1);
+  if (gqa_factor >= 5) {
+    return true;
+  }
   // Causal mask with T_q==1 reduces to "all keys visible" — handled by the
   // kernel without a special path.
-  (void)q_keys;
   (void)has_mask;
   (void)do_causal;
   return false;
