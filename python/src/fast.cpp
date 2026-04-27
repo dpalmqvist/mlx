@@ -297,6 +297,106 @@ void init_fast(nb::module_& parent_module) {
       )pbdoc");
 
   m.def(
+      "quantized_scaled_dot_product_attention",
+      [](const mx::array& queries,
+         const mx::array& q_keys,
+         const mx::array& k_scales,
+         const mx::array& k_biases,
+         const mx::array& q_values,
+         const mx::array& v_scales,
+         const mx::array& v_biases,
+         const float scale,
+         int group_size,
+         int bits,
+         const std::variant<std::monostate, std::string, mx::array>& mask,
+         const std::optional<mx::array>& sinks,
+         mx::StreamOrDevice s) {
+        bool has_mask = !std::holds_alternative<std::monostate>(mask);
+        bool has_str_mask =
+            has_mask && std::holds_alternative<std::string>(mask);
+        bool has_arr_mask = has_mask && std::holds_alternative<mx::array>(mask);
+
+        std::string mask_mode = "";
+        std::optional<mx::array> mask_arr = std::nullopt;
+        if (has_mask) {
+          if (has_str_mask) {
+            auto mask_str = std::get<std::string>(mask);
+            if (mask_str != "causal") {
+              std::ostringstream msg;
+              msg << "[quantized_scaled_dot_product_attention] invalid mask "
+                  << "option '" << mask_str << "'. Must be 'causal', or an array.";
+              throw std::invalid_argument(msg.str());
+            }
+            mask_mode = mask_str;
+          } else {
+            mask_arr = std::get<mx::array>(mask);
+          }
+        }
+        return mx::fast::quantized_scaled_dot_product_attention(
+            queries,
+            q_keys,
+            k_scales,
+            k_biases,
+            q_values,
+            v_scales,
+            v_biases,
+            scale,
+            group_size,
+            bits,
+            mask_mode,
+            mask_arr,
+            sinks,
+            s);
+      },
+      "q"_a,
+      "q_keys"_a,
+      "k_scales"_a,
+      "k_biases"_a,
+      "q_values"_a,
+      "v_scales"_a,
+      "v_biases"_a,
+      nb::kw_only(),
+      "scale"_a,
+      "group_size"_a = 64,
+      "bits"_a = 4,
+      "mask"_a = nb::none(),
+      "sinks"_a = nb::none(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def quantized_scaled_dot_product_attention(q: array, q_keys: array, k_scales: array, k_biases: array, q_values: array, v_scales: array, v_biases: array, *, scale: float, group_size: int = 64, bits: int = 4, mask: Union[None, str, array] = None, sinks: Optional[array] = None, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        SDPA where K and V are stored in :func:`mx.quantize` affine-quantized
+        form.
+
+        ``q_keys`` / ``q_values`` are the packed uint32 outputs of
+        :func:`mx.quantize`; ``k_scales`` / ``k_biases`` and ``v_scales`` /
+        ``v_biases`` are the per-group scales/biases. Quantization is along
+        ``head_dim`` (the last axis), with the same layout as
+        :func:`mx.quantize`.
+
+        v0 implementation decomposes via :func:`mx.dequantize` followed by
+        :func:`scaled_dot_product_attention`. A fused kernel that consumes
+        the quantized K/V directly is the intended optimization path.
+
+        Args:
+            q (array): Queries with shape ``[B, N_q, T_q, head_dim]``.
+            q_keys (array): Packed quantized keys.
+            k_scales (array): Key scales.
+            k_biases (array): Key biases.
+            q_values (array): Packed quantized values.
+            v_scales (array): Value scales.
+            v_biases (array): Value biases.
+            scale (float): Scale applied to ``Q`` before the dot product.
+            group_size (int): Quantization group size. Default: 64.
+            bits (int): Quantization bit width. Default: 4.
+            mask: Optional mask. ``"causal"`` or an array.
+            sinks (array, optional): Attention sinks.
+
+        Returns:
+            array: ``[B, N_q, T_q, head_dim]``.
+      )pbdoc");
+
+  m.def(
       "metal_kernel",
       [](const std::string& name,
          const std::vector<std::string>& input_names,

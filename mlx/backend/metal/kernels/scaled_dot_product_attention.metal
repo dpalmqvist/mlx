@@ -3,6 +3,7 @@
 // clang-format off
 #include "mlx/backend/metal/kernels/utils.h"
 #include "mlx/backend/metal/kernels/sdpa_vector.h"
+#include "mlx/backend/metal/kernels/sdpa_vector_quantized.h"
 
 using namespace metal;
 
@@ -41,4 +42,38 @@ using namespace metal;
 instantiate_sdpa_vector_heads(float)
 instantiate_sdpa_vector_heads(bfloat16_t)
 instantiate_sdpa_vector_heads(float16_t)
+
+// Quantized SDPA vector instantiations (bits=4 only). Single-pass plus
+// 2-pass pass-1; the existing sdpa_vector_2pass_2 kernel handles the
+// aggregation and is type-agnostic across quantized/dense.
+#define instantiate_sdpa_vector_quantized(type, qk_dim, value_dim, gs)         \
+  instantiate_kernel(                                                          \
+      "sdpa_vector_quantized_" #type "_" #qk_dim "_" #value_dim "_" #gs "_4",  \
+      sdpa_vector_quantized,                                                   \
+      type,                                                                    \
+      qk_dim,                                                                  \
+      value_dim,                                                               \
+      gs,                                                                      \
+      4)                                                                       \
+  instantiate_kernel(                                                          \
+      "sdpa_vector_quantized_2pass_1_" #type "_" #qk_dim "_" #value_dim "_" #gs "_4", \
+      sdpa_vector_quantized_2pass_1,                                           \
+      type,                                                                    \
+      qk_dim,                                                                  \
+      value_dim,                                                               \
+      gs,                                                                      \
+      4)
+
+#define instantiate_sdpa_vector_quantized_heads(type)    \
+  instantiate_sdpa_vector_quantized(type, 64, 64, 32)    \
+  instantiate_sdpa_vector_quantized(type, 64, 64, 64)    \
+  instantiate_sdpa_vector_quantized(type, 128, 128, 32)  \
+  instantiate_sdpa_vector_quantized(type, 128, 128, 64)  \
+  instantiate_sdpa_vector_quantized(type, 128, 128, 128) \
+  instantiate_sdpa_vector_quantized(type, 256, 256, 64)  \
+  instantiate_sdpa_vector_quantized(type, 256, 256, 128)
+
+instantiate_sdpa_vector_quantized_heads(float)
+instantiate_sdpa_vector_quantized_heads(bfloat16_t)
+instantiate_sdpa_vector_quantized_heads(float16_t)
     // clang-format on
