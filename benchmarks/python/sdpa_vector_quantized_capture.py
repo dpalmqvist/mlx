@@ -39,6 +39,14 @@ def main():
     p.add_argument("--ctx", type=int, default=32768)
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument(
+        "--iters",
+        type=int,
+        default=10,
+        help="Iterations executed inside the capture window. Matches the "
+        "MLX metal-debugger example (>1 reliably produces a non-empty "
+        "trace bundle).",
+    )
+    p.add_argument(
         "--variant",
         default="q4_sdpa",
         choices=VARIANTS,
@@ -93,9 +101,13 @@ def main():
     for _ in range(args.warmup):
         mx.eval(run())
 
-    print(f"starting capture -> {args.out}", flush=True)
+    print(
+        f"starting capture -> {args.out} ({args.iters} iters in capture)",
+        flush=True,
+    )
     mx.metal.start_capture(args.out)
-    mx.eval(run())
+    for _ in range(args.iters):
+        mx.eval(run())
     mx.metal.stop_capture()
     print(f"wrote {args.out}", flush=True)
     print(
