@@ -155,23 +155,37 @@ diagnosis).
 
    ```bash
    CMAKE_ARGS="-DMLX_METAL_DEBUG=ON -DCMAKE_BUILD_TYPE=Debug" \
-       uv pip install -e . --reinstall --no-deps --force-reinstall
+       uv pip install -e . --reinstall --no-deps
    ```
 
    Re-verify the flag still exists at those lines before relying on this
    command if substantial time has passed since the report was written.
-3. **Reduce the workload to a single dispatch.**
+3. **Capture programmatically into a `.gputrace` bundle.** A companion
+   script wraps the worst-cell dispatch in
+   `mx.metal.start_capture` / `stop_capture` and writes a
+   Xcode-openable trace. Generate all three variants (`q4_sdpa`,
+   `fp16_sdpa`, `dq_then_sdpa`) on the worst cell:
 
    ```bash
-   uv run python benchmarks/python/sdpa_vector_quantized_bench.py \
-       --models qwen-gqa --ctx 32768 \
-       --iters 1 --warmup 0
+   for v in q4_sdpa fp16_sdpa dq_then_sdpa; do
+     MTL_CAPTURE_ENABLED=1 \
+       python benchmarks/python/sdpa_vector_quantized_capture.py \
+         --variant "$v" --model qwen-gqa --ctx 32768
+   done
    ```
 
-4. **Capture in Xcode.** Open Xcode → Debug → Capture GPU Frame, attach to
-   the running Python process (use `--warmup 0` so the first dispatch is
-   not consumed by warmup), trigger one frame.
-5. **Inspect the `sdpa_vector_quantized` dispatch.** Read these counters/views
+   Output: `/tmp/sdpa_<variant>_qwen_gqa_32768.gputrace` per variant. The
+   `MTL_CAPTURE_ENABLED=1` env var is required for programmatic capture.
+   This avoids the Xcode-attach dance and produces a directly comparable
+   trace trio.
+4. **Open the captures in Xcode.**
+
+   ```bash
+   open -a Xcode /tmp/sdpa_q4_sdpa_qwen_gqa_32768.gputrace
+   ```
+
+   (Repeat for each variant in separate Xcode windows for side-by-side.)
+5. **Inspect the relevant SDPA dispatch.** Read these counters/views
    and write the value into §6:
    - **Occupancy** — low (<25%) usually means register or
      threadgroup-memory pressure.
