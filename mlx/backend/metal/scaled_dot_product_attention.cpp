@@ -1,5 +1,4 @@
 // Copyright © 2024 Apple Inc.
-#include <cstdlib>
 #include <sstream>
 
 #include "mlx/backend/common/compiled.h"
@@ -33,6 +32,7 @@ void sdpa_full_self_attention_nax(
   int wn = 1;
 
   int bd = q.shape(-1);
+  int bq = 64;
   int bk = 32;
 
   int B = q.shape(0);
@@ -42,38 +42,6 @@ void sdpa_full_self_attention_nax(
 
   int qL = q.shape(2);
   int kL = k.shape(2);
-
-  // Phase 6 tile-size tuning for D=128 NAX SDPA on M4 Pro. Empirically
-  // swept (bq, bk) ∈ {32, 64, 128} × {32, 64} across prefill SDPA at
-  // qL ∈ {1024..8192} for both Llama-3 8B (gqa_factor=4) and Qwen-GQA
-  // (gqa_factor=7). bq=32 was the unambiguous winner on llama at every
-  // qL (4-14% faster than the old (64, 32) default) and best or
-  // within-noise on qwen. Larger bq variants showed small wins on
-  // some qwen long-ctx cells in one sweep run but did not reproduce
-  // reliably across reruns; bq=32 is the conservative pick that's
-  // consistent across the bench-noise envelope.
-  // For D != 128, the .metal file only AOT-instantiates the original
-  // (64, 32) / (64, 64) pair, so the new default only fires on D=128.
-  int bq = (bd == 128) ? 32 : 64;
-
-  // Optional env-var overrides used by the tile-sweep harness in
-  // benchmarks/python/sdpa_nax_tile_sweep.py. Only valid AOT-compiled
-  // (bq, bk) values are honored; anything else silently falls back to
-  // the heuristic above.
-  auto valid_bq = [](int v) { return v == 32 || v == 64 || v == 128; };
-  auto valid_bk = [](int v) { return v == 32 || v == 64; };
-  if (const char* env_bq = std::getenv("MLX_NAX_SDPA_BQ")) {
-    int requested = std::atoi(env_bq);
-    if (valid_bq(requested) && bd == 128) {
-      bq = requested;
-    }
-  }
-  if (const char* env_bk = std::getenv("MLX_NAX_SDPA_BK")) {
-    int requested = std::atoi(env_bk);
-    if (valid_bk(requested)) {
-      bk = requested;
-    }
-  }
 
   const bool align_Q = (qL % bq) == 0;
   const bool align_K = (kL % bk) == 0;
