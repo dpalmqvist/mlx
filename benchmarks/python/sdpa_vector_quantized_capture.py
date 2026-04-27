@@ -42,9 +42,11 @@ def main():
         "--iters",
         type=int,
         default=10,
-        help="Iterations executed inside the capture window. Matches the "
-        "MLX metal-debugger example (>1 reliably produces a non-empty "
-        "trace bundle).",
+        help="Iterations executed inside the capture window. >1 reliably "
+        "produces a non-empty trace bundle (per MLX metal-debugger "
+        "example). Reduce to 2-3 if Xcode crashes on the resulting "
+        "bundle — at very long ctx the bundle can grow past 500 MB and "
+        "trip Xcode's memory limits.",
     )
     p.add_argument(
         "--variant",
