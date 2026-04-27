@@ -9,7 +9,10 @@
 
 - **Device:** Apple M4 Pro.
 - **NAX:** enabled per `bf760f92 Enable NAX selectively on M4 Pro`.
-- **MLX commit:** `37b9fb09` (branch `kv4-sdpa-profile`, off `kv4-sdpa`).
+- **MLX commit at the time of the run captured in §2:** `37b9fb09` (branch
+  `kv4-sdpa-profile`, off `kv4-sdpa`). Re-runs will tag CSV rows with
+  the current HEAD; the CSV's `git_sha` column is the authoritative
+  per-row provenance.
 - **macOS:** 26.3.1 (build 25D771280a).
 - **Xcode:** 26.4.1 (build 17E202).
 - **Python:** 3.13 via `uv`. MLX built editable from this branch.
