@@ -16,6 +16,21 @@ namespace mlx::core {
 
 namespace {
 
+// Optional override for the NAX-eligibility M threshold used by qmm_nax and
+// gather_qmm_nax (the general path). Default 256; sweep harness in
+// olmlx-model/benchmarks can lower this to characterize mid-M shapes.
+// Read on every dispatch (no static cache) so subprocess sweeps see env-var
+// changes between invocations even within a single warmed-up worker.
+int qmm_nax_m_threshold() {
+  if (const char* env = std::getenv("MLX_QMM_NAX_M_THRESHOLD")) {
+    int v = std::atoi(env);
+    if (v >= 0) {
+      return v;
+    }
+  }
+  return 256;
+}
+
 template <typename... Args>
 auto get_quantized_kernel_wrapped(
     metal::Device& d,
@@ -692,12 +707,16 @@ void qmm(
     metal::Device& d,
     const Stream& s,
     const std::string& mode) {
-  // The NAX qmm kernel uses bm=64 row tiles. For small M, the resulting
-  // partial-tile and dispatch overhead outweighs NAX's compute advantage
-  // (M4 Pro empirical data: NAX wins ~5-7% at M>=512; smaller M not yet
-  // characterized). 256 is conservative — refine with a denser M-sweep
-  // when convenient.
-  if (metal::is_nax_available() && transpose && (K % 64 == 0) && (M >= 256) &&
+  // The NAX qmm kernel uses bm=64 row tiles. For small M, the partial-tile
+  // and dispatch overhead outweighs NAX's compute advantage. Threshold 256
+  // is the empirical inflection on M4 Pro: NAX wins 3-5% at M >= 256 across
+  // both square (qkv) and wide (ffn_up) shapes; at M = 128 the picture is
+  // shape-dependent (~5% FFN win, ~3% qkv loss); at M < 64 NAX regresses by
+  // up to 40% on wide-N shapes due to the 64-row partial tile. See
+  // olmlx-model report 2026-04-27-nax-m-threshold-refinement.md.
+  // MLX_QMM_NAX_M_THRESHOLD env var lets a benchmark harness override.
+  if (metal::is_nax_available() && transpose && (K % 64 == 0) &&
+      (M >= qmm_nax_m_threshold()) &&
       (env::enable_tf32() || x.dtype() != float32)) {
     return qmm_nax(
         /* const array& x = */ x,
@@ -888,9 +907,11 @@ void gather_qmm(
     metal::Device& d,
     const Stream& s,
     const std::string& mode) {
-  // Same M>=256 gate as qmm_nax above. (For the rhs-specialized path see
-  // gather_qmm_rhs() below, which has its own M/E gate.)
-  if (metal::is_nax_available() && transpose && (K % 64 == 0) && (M >= 256) &&
+  // Same gate as qmm_nax above; honors MLX_QMM_NAX_M_THRESHOLD. (For the
+  // rhs-specialized path see gather_qmm_rhs() below, which has its own M/E
+  // gate.)
+  if (metal::is_nax_available() && transpose && (K % 64 == 0) &&
+      (M >= qmm_nax_m_threshold()) &&
       (env::enable_tf32() || x.dtype() != float32)) {
     return gather_qmm_nax(
         /* const array& x = */ x,
