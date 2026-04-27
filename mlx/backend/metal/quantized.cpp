@@ -692,7 +692,12 @@ void qmm(
     metal::Device& d,
     const Stream& s,
     const std::string& mode) {
-  if (metal::is_nax_available() && transpose && (K % 64 == 0) &&
+  // The NAX qmm kernel uses bm=64 row tiles. For small M, the resulting
+  // partial-tile and dispatch overhead outweighs NAX's compute advantage
+  // (M4 Pro empirical data: NAX wins ~5-7% at M>=512; smaller M not yet
+  // characterized). 256 is conservative — refine with a denser M-sweep
+  // when convenient.
+  if (metal::is_nax_available() && transpose && (K % 64 == 0) && (M >= 256) &&
       (env::enable_tf32() || x.dtype() != float32)) {
     return qmm_nax(
         /* const array& x = */ x,
@@ -883,7 +888,9 @@ void gather_qmm(
     metal::Device& d,
     const Stream& s,
     const std::string& mode) {
-  if (metal::is_nax_available() && transpose && (K % 64 == 0) &&
+  // Same M>=256 gate as qmm_nax above. (For the rhs-specialized path see
+  // gather_qmm_rhs() below, which has its own M/E gate.)
+  if (metal::is_nax_available() && transpose && (K % 64 == 0) && (M >= 256) &&
       (env::enable_tf32() || x.dtype() != float32)) {
     return gather_qmm_nax(
         /* const array& x = */ x,
@@ -1230,22 +1237,32 @@ void gather_qmm_rhs(
     const std::string mode) {
   if (metal::is_nax_available() && transpose &&
       (env::enable_tf32() || x_.dtype() != float32)) {
-    return gather_qmm_rhs_nax(
-        /* const array& x_ = */ x_,
-        /* const array& w_ = */ w_,
-        /* const array& scales_ = */ scales_,
-        /* const std::optional<array>& biases_ = */ biases_,
-        /* const array& indices_ = */ indices_,
-        /* array& out = */ out,
-        /* bool transpose = */ transpose,
-        /* int group_size = */ group_size,
-        /* int bits = */ bits,
-        /* int M = */ M,
-        /* int N = */ N,
-        /* int K = */ K,
-        /* metal::Device& d = */ d,
-        /* const Stream& s = */ s,
-        /* const std::string mode = */ mode);
+    // The NAX gather kernel uses bm=64 row tiles. With sorted indices, any
+    // threadgroup tile that straddles an expert boundary must load weights
+    // from two experts, doubling weight bandwidth for that tile. When M/E
+    // (rows per expert) is small relative to bm, most tiles straddle and
+    // NAX is a net loss vs the non-NAX path (bm=16). Empirical contour on
+    // M4 Pro (60 shapes) shows NAX gather wins only when M/E >= ~512.
+    int E = w_.size() / w_.shape(-1) / w_.shape(-2);
+    bool nax_profitable = E > 0 && (M / E) >= 512;
+    if (nax_profitable) {
+      return gather_qmm_rhs_nax(
+          /* const array& x_ = */ x_,
+          /* const array& w_ = */ w_,
+          /* const array& scales_ = */ scales_,
+          /* const std::optional<array>& biases_ = */ biases_,
+          /* const array& indices_ = */ indices_,
+          /* array& out = */ out,
+          /* bool transpose = */ transpose,
+          /* int group_size = */ group_size,
+          /* int bits = */ bits,
+          /* int M = */ M,
+          /* int N = */ N,
+          /* int K = */ K,
+          /* metal::Device& d = */ d,
+          /* const Stream& s = */ s,
+          /* const std::string mode = */ mode);
+    }
   }
 
   // Start by normalizing the indices
@@ -1274,6 +1291,8 @@ void gather_qmm_rhs(
   array scales = ensure_row_contiguous(scales_, d, s);
 
   // TODO: Tune the block sizes
+  // (M4 Pro tile sweep showed default is already optimal — see
+  //  olmlx-model M4_OPTIMIZATION_OPPORTUNITIES.md, item #3)
   int bm = 16, bn = 32, bk = 32;
   int wm = 1, wn = 2;
 

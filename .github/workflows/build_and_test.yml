@@ -25,6 +25,7 @@ jobs:
 
   linux_build_and_test:
     name: Linux (cpu, ${{ matrix.arch }})
+    if: github.repository == 'ml-explore/mlx'
     needs: check_lint
     strategy:
       fail-fast: false
@@ -76,8 +77,21 @@ jobs:
       - uses: ./.github/actions/setup-macos
       - uses: ./.github/actions/build-macos
 
+  mac_build_and_test_fork:
+    name: macOS (fork, github-hosted)
+    if: github.repository != 'ml-explore/mlx'
+    runs-on: macos-15
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+    needs: check_lint
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-macos
+      - uses: ./.github/actions/build-macos
+
   windows_build_and_test:
     name: Windows (cpu, x86_64)
+    if: github.repository == 'ml-explore/mlx'
     needs: check_lint
     runs-on: windows-2025
     steps:
@@ -97,6 +111,7 @@ jobs:
 
   linux_sanitizer_build_and_test:
     name: Linux Sanitizer Tests (${{ matrix.sanitizer }})
+    if: github.repository == 'ml-explore/mlx'
     needs: check_lint
     strategy:
       fail-fast: false
@@ -130,6 +145,7 @@ jobs:
 
   linux_fedora_build_cpp:
     name: Linux Fedora (${{ matrix.arch }})
+    if: github.repository == 'ml-explore/mlx'
     needs: check_lint
     strategy:
       fail-fast: false
