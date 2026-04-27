@@ -35,6 +35,10 @@ struct BaseNAXFrag {
 
   STEEL_CONST short kElemRowsJump = 8;
 
+  // Number of frags produced per MMA along N. The (16, 32, 16) descriptor
+  // produces a 16x32 output = 2 frags wide. tile_matmad_nax dispatches on this.
+  STEEL_CONST short kPacking = 2;
+
   static_assert(
       kElemRows * kElemCols == kElemsPerFrag,
       "MMAFrag shape is not consistent with MMAFrag size");
