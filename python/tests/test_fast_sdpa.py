@@ -683,5 +683,87 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                     self.assertTrue(mx.allclose(ref, out, **tolerance))
 
 
+    def test_quantized_sdpa_vector_matches_dequantized(self):
+        # KV-cache 4-bit quantization, decode-shape (T_q == 1).
+        # The v0 implementation decomposes via dequantize() -> SDPA, so we
+        # validate against an explicit dequantize-then-SDPA reference.
+        mx.random.seed(0)
+        Dq = 128
+        for dtype in [mx.float32, mx.float16]:
+            for kL in [256, 1024]:
+                for group_size, bits in [(64, 4), (32, 4), (64, 8)]:
+                    B, n_q_heads, n_kv_heads = 1, 8, 2
+                    q = mx.random.normal((B, n_q_heads, 1, Dq), dtype=dtype)
+                    k = mx.random.normal((B, n_kv_heads, kL, Dq), dtype=dtype)
+                    v = mx.random.normal((B, n_kv_heads, kL, Dq), dtype=dtype)
+                    scale = 1.0 / math.sqrt(Dq)
+
+                    qk, ks, kb = mx.quantize(k, group_size=group_size, bits=bits)
+                    qv, vs, vb = mx.quantize(v, group_size=group_size, bits=bits)
+
+                    out = mx.fast.quantized_scaled_dot_product_attention(
+                        q,
+                        qk,
+                        ks,
+                        kb,
+                        qv,
+                        vs,
+                        vb,
+                        scale=scale,
+                        group_size=group_size,
+                        bits=bits,
+                    )
+
+                    k_dq = mx.dequantize(
+                        qk, ks, kb, group_size=group_size, bits=bits
+                    ).astype(dtype)
+                    v_dq = mx.dequantize(
+                        qv, vs, vb, group_size=group_size, bits=bits
+                    ).astype(dtype)
+                    ref = mx.fast.scaled_dot_product_attention(
+                        q, k_dq, v_dq, scale=scale
+                    )
+                    # bits=4 routes to the fused Metal kernel which dequantizes
+                    # in fp32. The reference dequant+sdpa path materializes K/V
+                    # in `dtype` first, so for fp16 they diverge by per-dot-
+                    # product fp16 rounding (worse with longer kL).
+                    # bits=8 still goes through the decomposition fallback.
+                    if bits == 4 and dtype == mx.float16:
+                        atol, rtol = 5e-3, 5e-3
+                    else:
+                        atol, rtol = 1e-4, 1e-4
+                    self.assertTrue(
+                        mx.allclose(out, ref, atol=atol, rtol=rtol),
+                        f"quantized SDPA vs dequantize+SDPA outside tolerance "
+                        f"(dtype={dtype}, kL={kL}, gs={group_size}, bits={bits})",
+                    )
+
+    def test_quantized_sdpa_vector_quality_vs_fp(self):
+        # Check that 4-bit KV stays close to fp16 reference at decode shape.
+        # Tolerances are loose — quantization always loses something — but
+        # this catches catastrophic regressions in the API surface.
+        mx.random.seed(0)
+        D = 128
+        B, n_q_heads, n_kv_heads, kL = 1, 8, 2, 1024
+        dtype = mx.float16
+        q = mx.random.normal((B, n_q_heads, 1, D), dtype=dtype)
+        k = mx.random.normal((B, n_kv_heads, kL, D), dtype=dtype)
+        v = mx.random.normal((B, n_kv_heads, kL, D), dtype=dtype)
+        scale = 1.0 / math.sqrt(D)
+
+        ref = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale)
+
+        qk, ks, kb = mx.quantize(k, group_size=64, bits=4)
+        qv, vs, vb = mx.quantize(v, group_size=64, bits=4)
+        out = mx.fast.quantized_scaled_dot_product_attention(
+            q, qk, ks, kb, qv, vs, vb, scale=scale, group_size=64, bits=4
+        )
+        # 4-bit KV with random gaussians: typical max abs-error ~few % of the
+        # fp16 output magnitude. 0.05 is a generous ceiling that still fails
+        # if the API is wired up wrong.
+        diff = mx.abs(out.astype(mx.float32) - ref.astype(mx.float32))
+        self.assertLess(float(mx.max(diff)), 0.05)
+
+
 if __name__ == "__main__":
     mlx_tests.MLXTestRunner(failfast=True)

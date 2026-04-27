@@ -54,6 +54,34 @@ MLX_API array scaled_dot_product_attention(
     const std::optional<array>& sinks = {},
     StreamOrDevice s = {});
 
+/**
+ * SDPA where K and V are stored in mx.quantize() affine-quantized form.
+ *
+ * q_keys / q_values: packed uint32, last dim = head_dim * bits / 32.
+ * k_scales/biases, v_scales/biases: same dtype as queries; last dim =
+ * head_dim / group_size. Quantization is along head_dim (the last axis),
+ * matching mx.quantize() semantics.
+ *
+ * v0 implementation decomposes via dequantize() + scaled_dot_product_attention.
+ * A fused kernel that streams quantized K/V directly into attention is the
+ * intended optimization path; see plan in olmlx-model docs.
+ */
+MLX_API array quantized_scaled_dot_product_attention(
+    const array& queries,
+    const array& q_keys,
+    const array& k_scales,
+    const array& k_biases,
+    const array& q_values,
+    const array& v_scales,
+    const array& v_biases,
+    const float scale,
+    int group_size = 64,
+    int bits = 4,
+    const std::string& mask_mode = "",
+    std::optional<array> mask_arr = {},
+    const std::optional<array>& sinks = {},
+    StreamOrDevice s = {});
+
 using TemplateArg = std::variant<int, bool, Dtype>;
 using ScalarArg = std::variant<bool, int, float>;
 
