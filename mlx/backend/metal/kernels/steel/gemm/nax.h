@@ -532,6 +532,57 @@ struct BaseNAXFrag {
   }
 };
 
+///////////////////////////////////////////////////////////////////////////////
+// NAXFrag32 — 32x32 frag, single-frag MMA, layout-agnostic I/O via
+// tensor_inline. Used on g16 (M4 Pro), where matmul2d is only correct for
+// the (32, 32, 32) descriptor. See
+// docs/superpowers/specs/2026-04-27-nax-g16-fix-plan.md.
+///////////////////////////////////////////////////////////////////////////////
+
+struct NAXFrag32 {
+  STEEL_CONST short kFragRows = 32;
+  STEEL_CONST short kFragCols = 32;
+
+  STEEL_CONST short kElemsPerFrag = (kFragRows * kFragCols) / 32;  // 32
+
+  STEEL_CONST short kElemRows = 8;
+  STEEL_CONST short kElemCols = 4;
+
+  STEEL_CONST short kElemRowsJump = 1;  // unused — per-element offsets come
+                                        // from dr/dc tables, not a stride.
+
+  // One MMA produces one full 32x32 frag, i.e. unpacked.
+  STEEL_CONST short kPacking = 1;
+
+  static_assert(
+      kElemRows * kElemCols == kElemsPerFrag,
+      "NAXFrag32 shape is not consistent with its size");
+
+  template <typename U>
+  using dtype_frag_t = typename metal::vec<U, kElemsPerFrag>;
+
+  // Per-thread base coordinate in the 32x32 frag. Element i lives at
+  //   (a + dr[i % 8], b + dc[i / 8])
+  // with
+  //   a = ((lane & 1) << 1) | ((lane & 8) >> 1)        in {0, 2, 4, 6}
+  //   b = ((lane & 2) >> 1) | ((lane & 4) >> 1) | ((lane & 16) >> 2)  in {0..7}
+  //   dr = {0, 1, 8, 9, 16, 17, 24, 25}
+  //   dc = {0, 8, 16, 24}
+  // Source: tools/probe_nax_descriptor.py layout-dump variant on g16s.
+  METAL_FUNC static short2 get_coord() {
+    const ushort lane = __metal_get_thread_index_in_simdgroup(ushort());
+    const short a = ((lane & 1) << 1) | ((lane & 8) >> 1);
+    const short b = ((lane & 2) >> 1) | ((lane & 4) >> 1) | ((lane & 16) >> 2);
+    return short2{b, a};  // short2 is {x = col, y = row}
+  }
+
+  METAL_FUNC static short2 dr_dc(short i) {
+    constexpr short dr_table[8] = {0, 1, 8, 9, 16, 17, 24, 25};
+    constexpr short dc_table[4] = {0, 8, 16, 24};
+    return short2{dc_table[i / 8], dr_table[i % 8]};
+  }
+};
+
 template <
     typename T,
     short kTileRows_,
