@@ -22,7 +22,9 @@
 - **Iterations:** 100 measured + 10 warmup per cell. Median reported in the
   tables; p10/p90 in the CSV.
 
-### Methodology caveats (read before interpreting numbers)
+### Methodology notes (read before interpreting numbers)
+
+Caveats:
 
 - Each iteration is timed as a single `mx.eval(out)` round-trip, which captures
   Python dispatch + Metal encoder + GPU execute together. Treat absolute
@@ -36,7 +38,10 @@
 - `dq_then_sdpa` includes the `mx.dequantize(...)` calls inside the timed
   region by design. It measures the dequant + fp16 SDPA path as a unit, which
   is what the kernel under test is supposed to beat.
-- `q4_sdpa` and `dq_then_sdpa` are both verified against each other within
+
+Correctness:
+
+- `q4_sdpa` and `dq_then_sdpa` are verified against each other within
   `atol=rtol=5e-3` (per `python/tests/test_fast_sdpa.py:731-732`) before
   timing each cell. No correctness-gate failures occurred during this run.
 
@@ -90,11 +95,27 @@ llama3-8b), meaning each KV head is shared by 7 query heads (vs 4 on
 llama). The fp16 vector kernel can amortize K/V loads across query heads
 within a KV group, so its per-token cost grows slowly with the GQA ratio.
 The quantized kernel's dequant work scales with K/V tile reads, so a
-higher GQA ratio doesn't help it as much. The gap-vs-fp16 widening with
-ctx confirms this: at long ctx, K/V bandwidth dominates total work, and
-that is where the quantized path's dequant tax bites hardest.
+higher GQA ratio doesn't help it as much.
+
+**Bandwidth vs dequant-throughput — testable hypothesis for §6.** On
+qwen-gqa, the absolute `(q4 − fp16)` delta grows from 0.034 ms (ctx=1024)
+to 0.889 ms (ctx=32768) — roughly **26×** — while fp16 itself grows only
+from 0.13 ms to 0.50 ms (~3.7×). Pure bandwidth dominance would predict
+the delta to grow roughly with fp16 (linear in tile reads); 26×/3.7× ≈ 7×
+super-linear instead points to per-K/V-tile dequant cost as the dominant
+overhead, not just bandwidth. §6's frame-capture should distinguish these
+by reading ALU-active vs memory-wait directly — Phase 2 should not anchor
+on "bandwidth" without confirming.
 
 ## 4. Sanity check (q4 vs dequant→SDPA)
+
+> **Headline finding.** On `qwen-gqa`, `q4_sdpa` **loses to `dq_then_sdpa`
+> at every measured context length** (1.07× to 1.34× slower). The new
+> kernel never beats its own dequant fallback on this shape. **Phase 2's
+> primary success criterion is reversing this** — until then, qwen-style
+> GQA decode would currently be faster calling
+> `mx.dequantize(...)` + `mx.fast.scaled_dot_product_attention(...)` than
+> calling `mx.fast.quantized_scaled_dot_product_attention(...)` directly.
 
 The premise of the new kernel is that running SDPA directly on packed 4-bit
 K/V is faster than dequantizing first and then running fp16 SDPA. The
@@ -103,17 +124,18 @@ K/V is faster than dequantizing first and then running fp16 SDPA. The
 - **llama3-8b**: q4_sdpa beats dq_then_sdpa (`q4/dq < 1.0×`) at ctx ≥ 2048
   (0.98× → 0.84×). At ctx=1024 it loses (1.24×). The kernel earns its keep
   on this shape from medium context onward.
-- **qwen-gqa**: q4_sdpa **loses to dq_then_sdpa across the entire sweep**
-  (1.07× → 1.34×). The new kernel never beats the dequant fallback on this
-  shape. This is the correctness-of-purpose failure the spec called out:
-  on qwen-gqa we would currently be better off calling
-  `mx.dequantize(...)` followed by `mx.fast.scaled_dot_product_attention(...)`
-  rather than `mx.fast.quantized_scaled_dot_product_attention(...)`.
+- **qwen-gqa**: q4_sdpa loses across the entire sweep, as called out
+  above.
 
-This finding is what makes Phase 2 worth doing — and it argues that
-"profile-first" was the correct framing: without this run we would not
-have known the kernel underperforms its own fallback on a real model
-shape.
+This is the correctness-of-purpose failure the spec called out — and what
+makes Phase 2 worth doing. It argues that "profile-first" was the correct
+framing: without this run we would not have known the kernel
+underperforms its own fallback on a real model shape. The headline
+finding is more actionable than the raw `q4/fp16 = 2.79×` worst-cell
+number from §3, because closing the gap to fp16 (which has no dequant
+work at all) may be physically limited, while beating the dequant
+fallback is definitionally achievable — the fallback is the kernel's own
+floor.
 
 ## 5. Frame-capture playbook
 
@@ -124,11 +146,17 @@ diagnosis).
    ratio in §3. Currently: `qwen-gqa @ ctx=32768`. Secondary: `qwen-gqa @
    ctx=16384` (2.57×) since it runs faster, which makes the capture cycle
    tighter.
-2. **Build MLX with debug shaders.** Verify the actual flag in
-   `mlx/backend/metal/CMakeLists.txt` before running; do not commit a
-   guessed flag name. The build env is otherwise the standard MLX dev build
-   (`uv pip install -e .` with `CMAKE_BUILD_TYPE=Debug` and the metal-debug
-   flag set as an env var or cmake arg).
+2. **Build MLX with debug shaders.** The flag is `MLX_METAL_DEBUG`, defined
+   at `CMakeLists.txt:39` (top-level) and gated at `CMakeLists.txt:177-178`
+   (verified at write-time on `kv4-sdpa-profile`). Build via:
+
+   ```bash
+   CMAKE_ARGS="-DMLX_METAL_DEBUG=ON -DCMAKE_BUILD_TYPE=Debug" \
+       uv pip install -e . --reinstall --no-deps --force-reinstall
+   ```
+
+   Re-verify the flag still exists at those lines before relying on this
+   command if substantial time has passed since the report was written.
 3. **Reduce the workload to a single dispatch.**
 
    ```bash
