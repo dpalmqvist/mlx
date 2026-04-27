@@ -587,6 +587,55 @@ struct NAXFrag32 {
     constexpr short dc_table[4] = {0, 8, 16, 24};
     return short2{dc_table[i / 8], dr_table[i % 8]};
   }
+
+  template <
+      typename CType,
+      typename AType,
+      typename BType,
+      bool transpose_a = false,
+      bool transpose_b = false>
+  METAL_FUNC static constexpr void mma(
+      thread dtype_frag_t<CType>& C,
+      const thread dtype_frag_t<AType>& A,
+      metal::bool_constant<transpose_a>,
+      const thread dtype_frag_t<BType>& B,
+      metal::bool_constant<transpose_b>) {
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+        32,
+        32,
+        32,
+        transpose_a,
+        transpose_b,
+        true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+
+    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> gemm_op;
+
+    auto ct_a =
+        gemm_op
+            .template get_left_input_cooperative_tensor<AType, BType, CType>();
+    auto ct_b =
+        gemm_op
+            .template get_right_input_cooperative_tensor<AType, BType, CType>();
+    auto ct_c = gemm_op.template get_destination_cooperative_tensor<
+        decltype(ct_a),
+        decltype(ct_b),
+        CType>();
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemsPerFrag; i++) {
+      ct_a[i] = A[i];
+      ct_b[i] = B[i];
+      ct_c[i] = C[i];
+    }
+
+    gemm_op.run(ct_a, ct_b, ct_c);
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemsPerFrag; i++) {
+      C[i] = ct_c[i];
+    }
+  }
 };
 
 template <
