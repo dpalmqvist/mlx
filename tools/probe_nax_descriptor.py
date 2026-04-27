@@ -11,6 +11,8 @@ import sys
 import mlx.core as mx
 import numpy as np
 
+THREADGROUP_SIZE = 32
+
 HEADER = """
 #include <metal_stdlib>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -65,8 +67,8 @@ threadgroup float tgA[M*K];
 threadgroup float tgB[K*N];
 
 uint tid = thread_position_in_threadgroup.x;
-for (uint i = tid; i < M*K; i += 32) tgA[i] = ((device float*)A)[i];
-for (uint i = tid; i < K*N; i += 32) tgB[i] = ((device float*)B)[i];
+for (uint i = tid; i < M*K; i += {THREADGROUP_SIZE}) tgA[i] = ((device float*)A)[i];
+for (uint i = tid; i < K*N; i += {THREADGROUP_SIZE}) tgB[i] = ((device float*)B)[i];
 threadgroup_barrier(mem_flags::mem_threadgroup);
 
 matmul2d<desc, execution_simdgroup> op;
@@ -112,7 +114,7 @@ def run_one_tg(M, N, K, rp):
     A_np = np.random.RandomState(0).randint(-3, 4, (M, K)).astype(np.float32)
     B_np = np.random.RandomState(1).randint(-3, 4, (K, N)).astype(np.float32)
     A = mx.array(A_np); B = mx.array(B_np)
-    out = k(inputs=[A, B], grid=(32, 1, 1), threadgroup=(32, 1, 1),
+    out = k(inputs=[A, B], grid=(THREADGROUP_SIZE, 1, 1), threadgroup=(THREADGROUP_SIZE, 1, 1),
             output_shapes=[(M, N)], output_dtypes=[mx.float32])
     mx.eval(out[0])
     ref = A_np @ B_np
@@ -150,6 +152,7 @@ def main():
     print()
     print(f"{'(M, N, K, rp) [tg-staged]':<28}  {'max|err|':>10}  verdict")
     print("-" * 56)
+    # (16, 32, 16) is a negative control: WRONG expected even with tg staging
     for c in [(32, 32, 32, False), (32, 32, 32, True), (16, 32, 16, False)]:
         try:
             err = run_one_tg(*c)
