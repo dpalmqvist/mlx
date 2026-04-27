@@ -11,11 +11,19 @@
       "_wm" #wm "_wn" #wn "_mask" #mname,                                \
   attention_nax, dtype, bq, bk, bd, wm, wn, mtype, float)
 
-#define instantiate_attn_shapes_helper(iname, itype, mname, mtype)  \
-    instantiate_attn(iname, itype, 64, 32, 128, 4, 1, mname, mtype) \
-    instantiate_attn(iname, itype, 64, 32,  64, 4, 1, mname, mtype) \
-    instantiate_attn(iname, itype, 64, 64, 128, 4, 1, mname, mtype) \
-    instantiate_attn(iname, itype, 64, 64,  64, 4, 1, mname, mtype)
+#define instantiate_attn_shapes_helper(iname, itype, mname, mtype)   \
+    instantiate_attn(iname, itype, 64, 32, 128, 4, 1, mname, mtype)  \
+    instantiate_attn(iname, itype, 64, 32,  64, 4, 1, mname, mtype)  \
+    instantiate_attn(iname, itype, 64, 64, 128, 4, 1, mname, mtype)  \
+    instantiate_attn(iname, itype, 64, 64,  64, 4, 1, mname, mtype)  \
+    /* Phase 6 tile-sweep additions: tile-size variants for D=128 */ \
+    /* SDPA NAX dispatch on M4 Pro. Defaults stay (bq=64, bk=32);  */ \
+    /* these are extra AOT instantiations selectable via the      */ \
+    /* MLX_NAX_SDPA_BQ / MLX_NAX_SDPA_BK env-var overrides.        */ \
+    instantiate_attn(iname, itype, 32, 32, 128, 4, 1, mname, mtype)  \
+    instantiate_attn(iname, itype,128, 32, 128, 4, 1, mname, mtype)  \
+    instantiate_attn(iname, itype, 32, 64, 128, 4, 1, mname, mtype)  \
+    instantiate_attn(iname, itype,128, 64, 128, 4, 1, mname, mtype)
 
 #define instantiate_attn_mask_helper(iname, itype) \
     instantiate_attn_shapes_helper(iname, itype, iname, itype) \
