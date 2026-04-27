@@ -3,7 +3,7 @@
 **Date:** 2026-04-27
 **Spec:** [`../specs/2026-04-27-phase3-measurement-design.md`](../specs/2026-04-27-phase3-measurement-design.md)
 **Branch:** `kv4-sdpa-phase3-measure`
-**Status:** §M2 (microbenchmark) complete and analyzed. §M1 (Xcode counters) pending — needs interactive Xcode work that the CLI cannot do on this hardware/OS combo (see Phase 1 §6.1).
+**Status:** Both §M2 (microbenchmark) and §M1 (Xcode counters) complete. Bottleneck identified: register-pressure-driven low occupancy on a memory-latency-bound kernel. Phase 4 candidates ranked.
 
 ## 1. Setup
 
@@ -130,75 +130,175 @@ without GPU counters: count register usage in the compiled shader, or
 look for any spill bytes. M1's Xcode pipeline-statistics readout
 will answer this directly.
 
-## 3. M1 Xcode Counter Readings — TO BE FILLED IN
+## 3. M1 Xcode Counter Readings
 
-Pending interactive work in Xcode against the captures from §1.
-Per-counter slots:
+From the qwen-gqa @ ctx=8192 captures, Profile-after-reload, Counters
+tab, with the dominant pass-1 dispatch selected.
 
-### sdpa_vector_quantized_2pass_1_float16_t_128_128_64_4 (q4 path)
+(`/tmp/sdpa_q4_sdpa_8192.gputrace` and `/tmp/sdpa_fp16_sdpa_8192.gputrace`
+both 205 MB, release-build metallib. Larger ctx=32768 captures
+crashed Xcode, but the bottleneck pattern is identical at 8192
+because the gap is per-K-position structural, not ctx-specific.)
 
-| Counter | Value | Source |
-|---|---|---|
-| Limiter | _ | Performance pane → Limiter column |
-| ALU active % | _ | Counters → Compute group |
-| F16 active % | _ | Counters → Compute group |
-| F32 active % | _ | Counters → Compute group |
-| Memory stall % | _ | Counters → Memory group |
-| L1 Buffer Cache Hit % | _ | Counters → Cache group |
-| L2 Cache Hit % | _ | Counters → Cache group |
-| Occupancy | _ | Pipeline overview |
-| Register allocation | _ regs | Pipeline Statistics |
-| Spill bytes | _ B | Pipeline Statistics |
-| Top hot source line | _ | Shader Profiler (Profile button) |
-| 2nd hot line | _ | Shader Profiler |
-| 3rd hot line | _ | Shader Profiler |
+### Compared per dispatch
 
-### sdpa_vector_2pass_1_float16_128_128 (fp16 path, comparison)
+| Counter | q4 (`sdpa_vector_quantized_2pass_1`) | fp16 (`sdpa_vector_2pass_1`) | Δ |
+|---|---:|---:|---:|
+| GPU time share (this dispatch) | **97.93%** of 1.11 ms total | (n/a — different trace) | — |
+| ALU Utilization | 26.74% | 26.74% | **same** |
+| F16 Utilization | 0.00% | 17.51% | q4 doesn't use fp16 ALU at all |
+| F32 Utilization | 17.51% | 20.90% | both fp32-heavy |
+| Allocated registers per thread | **72** | **50** | **q4 = +22 (+44%)** |
+| SIMD Groups dispatched | 7082 | 7208 | within 2% (same workload) |
 
-| Counter | Value |
-|---|---|
-| Limiter | _ |
-| ALU active % | _ |
-| F16 active % | _ |
-| Memory stall % | _ |
-| L2 Cache Hit % | _ |
-| Occupancy | _ |
-| Register allocation | _ regs |
-| Spill bytes | _ B |
-| Top hot source line | _ |
+Counter labels we couldn't surface: per-counter Memory stall %, L1 /
+L2 cache hit rates, occupancy (these may live in the Heat Map or
+Counters tab under different names; not pursued because the data we
+have is already enough — see §4).
 
-The deltas between the two are the most actionable single piece of
-data Phase 3 can produce.
+### What the numbers say, in plain terms
 
-## 4. Synthesis — TO BE WRITTEN AFTER §3
+- **Both kernels are equally memory-stalled.** ALU Utilization 27%
+  in both means both spend ~73% of GPU cycles waiting on
+  something — most of which is memory in this kernel class.
+- **Same wall-clock fraction, different absolute work.** Same 27%
+  active means q4's wall-clock × 0.27 = absolute ALU time for q4,
+  fp16's wall-clock × 0.27 = absolute ALU time for fp16. q4's wall
+  clock is ~2× fp16's at this cell, so absolute ALU work is ~2×.
+  Consistent with §6.2's per-K op count (30 vs 14).
+- **q4 uses 44% more registers per thread.** 72 vs 50. That's the
+  **decisive new finding**. Higher register count reduces how many
+  simdgroups can run concurrently on each GPU core (the register
+  file per core is fixed). Fewer concurrent simdgroups → less
+  ability to hide memory latency by switching threadgroups during
+  stalls → more time spent stalled in absolute terms, even when
+  the *fraction* stalled looks identical.
+- **q4's compiler doesn't fp16-promote.** F16 Utilization = 0%
+  while fp16's is 17.51%. This confirms Phase 2 §7.2 surgical
+  change had to be explicit (it didn't auto-happen) — and explains
+  why §7.2's null result happened anyway: ALU isn't the bottleneck
+  in the first place, so reducing ALU op cost doesn't move
+  wall-clock noticeably.
 
-Pending §3. Likely structure:
+## 4. Synthesis
 
-- The §M2 result + §M1 register/occupancy delta tells us whether
-  hypothesis (1) above is correct.
-- If yes: Phase 4 is "reduce register pressure on q4 inner loop"
-  (e.g., spill scales/biases to threadgroup memory but lazily, OR
-  recompute group_idx per-iter to avoid per-lane register hold, OR
-  fuse the K and V dequant into a single op so one set of state is
-  reused).
-- If no (registers are equal): the bottleneck is (2) instruction
-  count, in which case the only lever is reducing instructions
-  per iter (e.g., precompute scale*bias-table per group on launch).
-- If memory stall is high: the bottleneck is (3) load pattern, in
-  which case the lever is widening the per-lane packed load (e.g.,
-  reading uint32 of nibbles even when only 2 are needed, then
-  discarding).
+The q4 kernel is **memory-latency-bound, gated by register-pressure-driven low occupancy**. Phase 1 §6's "ALU-bound on dequant"
+diagnosis was wrong on both counts (ALU at 27%, dequant runs at
+memory bandwidth in M2). The actual story:
 
-## 5. Phase 4 Candidates — TO BE RANKED AFTER §3
+1. **Memory access is the wall-clock dominator.** Both kernels
+   stall ~73% of the time. q4 reads 12 B/K-position vs fp16's 16
+   B, so q4 has slightly less raw memory traffic — but...
+2. **q4's high register count reduces occupancy**, leaving more
+   time spent stalled per lane because fewer alternative
+   threadgroups are ready to run during a memory wait.
+3. **q4's ALU work is also genuinely larger** (30 vs 14
+   ops/K-position), so its absolute ALU time scales 2× under the
+   same 27% utilization fraction.
 
-Will reference §4. Empty until §3 is filled.
+Both factors compound multiplicatively. (Halving register count
+without changing ALU work, or vice versa, would only get part of
+the way.)
 
-## 6. Workflow note
+Phase 2 §7.1 (share dequant via threadgroup memory + barriers)
+failed because it added barrier overhead without reducing register
+pressure or absolute ALU work. Phase 2 §7.2 (fp16 dequant FMAs)
+failed because reducing ALU work in the dequant FMAs by ~2×
+translates to ~5% wall-clock at most (since FMAs are a small
+fraction of the 27% ALU time, and the rest is integer extract +
+load).
 
-The Xcode UI work in §3 is gated on user time, not technical capability. Counters that the CLI cannot reach on M4 Pro / macOS 26.3 (Phase 1 §6.1) require Xcode-Debug-Capture-GPU-Frame manual readings.
+## 5. Phase 4 Candidates — ranked by counter evidence
 
-To minimize the user's session: open `/tmp/sdpa_q4_sdpa_qwen_gqa_32768.gputrace`, click **Profile** (stopwatch icon top-right) to re-run with full counters, wait ~30s, then in the resulting view:
+### 5.1 Reduce register count from 72 to ≤50 (HIGHEST EXPECTED IMPACT)
 
-1. Performance pane (left nav, the "16 ms" entry) → sortable list of dispatches → click `sdpa_vector_quantized_2pass_1_*` → right inspector shows Limiter + counters.
-2. Click **Shaders** view → select the kernel → see **per-source-line ALU cost**. Top 3 hot lines are the most actionable single readout.
-3. Repeat steps 1–2 on `/tmp/sdpa_fp16_sdpa_qwen_gqa_32768.gputrace`.
+Match fp16's 50-register baseline. Closing 22 registers is the
+single biggest lever the §3 numbers point at. Concrete sub-levers:
+
+**5.1.a Eliminate intermediate `k[]` and `vals[]` arrays.** Currently
+the inner loop dequants all qk_per_thread (=4) K nibbles into
+`k[0..3]`, then a separate loop multiplies them into `score`. Same
+for V. Fuse dequant + FMA so only one nibble is live at a time:
+
+```cpp
+// Current (4 regs held simultaneously)
+for (int j = 0; j < 4; j++) k[j] = dequant_j;
+U score = 0;
+for (int j = 0; j < 4; j++) score += q[j] * k[j];
+
+// Proposed (1 reg held)
+U score = 0;
+for (int j = 0; j < 4; j++) {
+  U kj = dequant_j;
+  score += q[j] * kj;
+}
+```
+
+**Expected savings:** ~6 registers (3 for k, 3 for vals — `o[]`
+must stay across the AV loop and `q[]` across iterations).
+
+**5.1.b Combine with `typedef T U` (Phase 2 §7.2 aggressive).**
+Halves the per-element register footprint of `q[]`, `o[]`, intermediates from fp32 to fp16. 4 fp32 = 4 regs vs 4 fp16 = 2 regs (Apple GPU register granularity is 32-bit; 2 fp16 packed into 1 reg).
+Need to fix the bfloat compile error (`U max_score = U(-INFINITY)`,
+explicit casts on `static_cast<U>` boundaries). Not a typedef
+change alone — needs a full audit.
+
+**Expected savings:** ~8 registers.
+
+**Combined 5.1.a + 5.1.b**: 14-register reduction. From 72 → ~58.
+Closes most of the 22-register gap to fp16.
+
+**Expected wall-clock impact**: occupancy improvement is non-linear
+in register count (Apple GPUs allocate simdgroups per-core in
+discrete buckets). 72 → 58 may bump the kernel from N to N+1
+simdgroups per core, materially improving latency hiding. Optimistic
+case: 30-50% wall-clock reduction on the q4 kernel.
+
+### 5.2 Cache scales/biases per group in threadgroup memory (MEDIUM)
+
+Phase 2 §7.3 originally said "small lever". With Phase 3 data, this
+deserves a re-look: scales/biases are reloaded every K iter even
+though they only change every group_size=64 K positions. With BN=32
+(simdgroups iterating in stride 32 along K), every other outer iter
+falls in the same group → identical scale/bias values on consecutive
+outer iters.
+
+Implementation: at group boundaries (i % group_size == 0), the
+producer simdgroup writes `scale, bias` into threadgroup memory;
+all simdgroups read on subsequent iters until the next boundary.
+
+Unlike Phase 2 §7.1 (which barrier'd every K iter), this barriers
+once per group (= once per 64 K iters), so barrier overhead is
+~64× less per kernel call. Should not regress like §7.1 did.
+
+**Expected savings:** small fraction of memory traffic
+(scales/biases are ~25% of total q4 byte volume), so wall-clock
+improvement is bounded at ~10%. Bundle with 5.1.
+
+### 5.3 Pre-fetch K/V loads to overlap with dequant ALU (LOW)
+
+Currently each K iter has: load → dequant → score → softmax → load V → AV. The two loads are serial within an iter. Issuing the V load earlier (e.g. unrolled across two K iters) might overlap V load with iter-N's softmax.
+
+**Expected savings:** unclear without microbenchmark. Modest.
+
+### 5.4 Rejected as next step
+
+- §7.1 (full shared dequant) — disproven by Phase 2.
+- §7.2 surgical (fp16 dequant FMAs) — null result by Phase 2; the lever was real but too small.
+- Tile-size tuning — same kernel structure as fp16 path which is well-tuned; no expected win there.
+
+### Phase 4 success criterion (unchanged from Phase 1 §4)
+
+`q4_sdpa` must beat its own `dq_then_sdpa` fallback at every
+context length on `qwen-gqa`. Currently 1.07–1.34× slower. 5.1.a +
+5.1.b together should clear this.
+
+## 6. Reproduction
+
+For future Phase N reruns of M1:
+
+1. Build MLX in Release mode (debug captures crash Xcode at ctx ≥ 8192 due to a 343 MB embedded metallib snapshot).
+2. Generate captures via `benchmarks/python/sdpa_vector_quantized_capture.py --variant {q4_sdpa,fp16_sdpa} --ctx 8192 --iters 3 --out /tmp/<name>.gputrace` (release captures are ~205 MB and open cleanly; ctx=32768 captures are ~365 MB and may still crash on this Xcode/macOS combo).
+3. `open -a Xcode /tmp/<name>.gputrace` → click "Profile after reload" (stopwatch icon top-right) → wait ~30s for full counter collection.
+4. Performance pane → sort by GPU Time descending → click the dominant `sdpa_vector_*_2pass_1*` row.
+5. Counters tab → read ALU Utilization, F16 Utilization, F32 Utilization. Allocated registers + SIMD Groups are visible in the Top Shaders table on the Overview tab.
