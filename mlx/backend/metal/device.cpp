@@ -836,13 +836,17 @@ bool is_nax_available() {
       can_use_nax = true;
     }
     auto& d = metal::device(mlx::core::Device::gpu);
+    auto arch = d.get_architecture().back();
     auto gen = d.get_architecture_gen();
-    // Apple's GPU IP-family numbering doesn't track chip generation linearly:
-    // M4 Pro reports applegpu_g16s (gen=16, suffix='s'), not the assumed
-    // 'g18p'. The original gate (gen>=17 for non-'p') excluded M4 Pro entirely.
-    // Empirical M4 Pro tests (see olmlx-model M4_OPTIMIZATION_OPPORTUNITIES.md)
-    // show NAX is correct on g16s for the gated dispatch paths.
-    can_use_nax &= gen >= 16;
+    // M4 Pro (applegpu_g16s) was previously enabled with gen>=16, but
+    // tools/probe_nax_descriptor.py shows MPP matmul2d on g16s only
+    // produces correct results with descriptor (32,32,32) — every smaller
+    // or asymmetric descriptor (including the (16,32,16) used throughout
+    // the NAX kernels) returns wrong values via the layout-agnostic
+    // tensor_inline + cT.load/store path. Re-enabling NAX on g16 needs a
+    // dedicated 32x32 frag and kernel variant; see
+    // docs/superpowers/specs/2026-04-27-nax-g16-fix-plan.md.
+    can_use_nax &= gen >= (arch == 'p' ? 18 : 17);
     return can_use_nax;
   };
   static bool is_nax_available_ = _check_nax();
