@@ -86,24 +86,25 @@ struct NAXFrag32 {
   using dtype_frag_t = typename metal::vec<U, kElemsPerFrag>;
 
   // Per-thread base coordinate in the 32x32 frag. Element i lives at
-  //   (b + dc[i / 8], a + dr[i % 8])  // {col, row} — matches short2 / dr_dc()
+  //   (b + dc[i % 8], a + dr[i / 8])  // {col, row} — matches short2 / dr_dc()
   // with
-  //   a = ((lane & 1) << 1) | ((lane & 8) >> 1)        in {0, 2, 4, 6}
-  //   b = ((lane & 2) >> 1) | ((lane & 4) >> 1) | ((lane & 16) >> 2)  in {0..7}
-  //   dr = {0, 1, 8, 9, 16, 17, 24, 25}
-  //   dc = {0, 8, 16, 24}
+  //   a (row base, 8 values in {0..7}) = ((lane & 2) >> 1) | ((lane & 4) >> 1) | ((lane & 16) >> 2)
+  //   b (col base, 4 values in {0,2,4,6}) = ((lane & 1) << 1) | ((lane & 8) >> 1)
+  //   dr = {0, 8, 16, 24}                          // 4 row offsets
+  //   dc = {0, 1, 8, 9, 16, 17, 24, 25}            // 8 col offsets
   // Source: tools/probe_nax_descriptor.py layout-dump variant on g16s.
+  // (Note: spec's dr/dc labels were swapped vs the actual cooperative-tensor layout — corrected in commit at Task 1.6b. The numerical values are unchanged.)
   METAL_FUNC static short2 get_coord() {
     const ushort lane = __metal_get_thread_index_in_simdgroup(ushort());
-    const short a = ((lane & 1) << 1) | ((lane & 8) >> 1);
-    const short b = ((lane & 2) >> 1) | ((lane & 4) >> 1) | ((lane & 16) >> 2);
+    const short a = ((lane & 2) >> 1) | ((lane & 4) >> 1) | ((lane & 16) >> 2);  // 8 values — row base
+    const short b = ((lane & 1) << 1) | ((lane & 8) >> 1);                       // 4 values — col base
     return short2{b, a};  // short2 is {x = col, y = row}
   }
 
   METAL_FUNC static short2 dr_dc(short i) {
-    constexpr short dr_table[8] = {0, 1, 8, 9, 16, 17, 24, 25};
-    constexpr short dc_table[4] = {0, 8, 16, 24};
-    return short2{dc_table[i / 8], dr_table[i % 8]};
+    constexpr short dr_table[4] = {0, 8, 16, 24};                  // 4 row offsets
+    constexpr short dc_table[8] = {0, 1, 8, 9, 16, 17, 24, 25};   // 8 col offsets
+    return short2{dc_table[i % 8], dr_table[i / 8]};               // {col_off, row_off}
   }
 
   template <
