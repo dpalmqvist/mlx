@@ -218,6 +218,65 @@ struct NAXFrag32 {
     ct.store(view);
   }
 
+  // Device-memory variant of the contiguous load. Same body as the
+  // threadgroup overload above with the address space swapped — used by
+  // NAXTile's aligned device-pointer load and by gemm_epilogue's aligned
+  // C-load. Validated by tools/probe_nax_frag32.py::test_mma_via_dv_load_store.
+  template <typename T, typename U>
+  METAL_FUNC static void load(
+      thread dtype_frag_t<T>& dst,
+      const device U* src,
+      const short ld) {
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+        32, 32, 32,
+        /*transpose_left=*/false,
+        /*transpose_right=*/false,
+        /*relaxed_precision=*/true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+    auto ct = op.template get_left_input_cooperative_tensor<T, T, T>();
+
+    metal::dextents<int32_t, 2> ext(32, ld);
+    metal::tensor<device U, metal::dextents<int32_t, 2>, metal::tensor_inline>
+        view(const_cast<device U*>(src), ext);
+    ct.load(view);
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemsPerFrag; i++) {
+      dst[i] = static_cast<T>(ct[i]);
+    }
+  }
+
+  // Device-memory variant of the contiguous store. Same body as the
+  // threadgroup overload with the address space swapped.
+  template <typename T, typename U>
+  METAL_FUNC static void store(
+      const thread dtype_frag_t<T>& src,
+      device U* dst,
+      const short ld) {
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+        32, 32, 32,
+        /*transpose_left=*/false,
+        /*transpose_right=*/false,
+        /*relaxed_precision=*/true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+    auto ct = op.template get_destination_cooperative_tensor<
+        decltype(op.template get_left_input_cooperative_tensor<T, T, T>()),
+        decltype(op.template get_right_input_cooperative_tensor<T, T, T>()),
+        T>();
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemsPerFrag; i++) {
+      ct[i] = static_cast<T>(src[i]);
+    }
+
+    metal::dextents<int32_t, 2> ext(32, ld);
+    metal::tensor<device U, metal::dextents<int32_t, 2>, metal::tensor_inline>
+        view((device U*)dst, ext);
+    ct.store(view);
+  }
+
   // Load a 32x32 frag from device memory, zero-fill out-of-bounds elements.
   // Strategy B: caller provides a threadgroup scratch buffer (32*32 elements).
   // Each lane fills its slice of the staging buffer with bounds-checked copies
@@ -561,6 +620,59 @@ def test_mma_via_tg_load_store():
         )
 
 
+def test_mma_via_dv_load_store():
+    """End-to-end mma via NAXFrag32::load (tensor_inline over device) →
+    mma → NAXFrag32::store (tensor_inline over device). Validates the
+    device-pointer I/O path added in Task 2.0 that NAXTile's aligned
+    load/store and gemm_epilogue's aligned C-load will use.
+    """
+    src = """
+    using Frag = NAXFrag32;
+
+    Frag::dtype_frag_t<float> a_frag, b_frag, c_frag;
+    Frag::load(a_frag, (const device float*)A, (short)32);
+    Frag::load(b_frag, (const device float*)B, (short)32);
+
+    STEEL_PRAGMA_UNROLL
+    for (uint16_t i = 0; i < Frag::kElemsPerFrag; ++i) c_frag[i] = 0.0f;
+
+    Frag::mma(c_frag,
+              a_frag, metal::bool_constant<false>{},
+              b_frag, metal::bool_constant<false>{});
+
+    Frag::store(c_frag, (device float*)C, (short)32);
+    """
+    k = mx.fast.metal_kernel(
+        name="probe_naxfrag32_dv_load_store",
+        input_names=["A", "B"],
+        output_names=["C"],
+        source=src,
+        header=HEADER,
+    )
+    A_np = np.random.RandomState(0).randint(-3, 4, (32, 32)).astype(np.float32)
+    B_np = np.random.RandomState(1).randint(-3, 4, (32, 32)).astype(np.float32)
+    A = mx.array(A_np)
+    B = mx.array(B_np)
+    out = k(
+        inputs=[A, B],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(32, 32)],
+        output_dtypes=[mx.float32],
+    )
+    mx.eval(out[0])
+    ref = A_np @ B_np
+    err = float(np.max(np.abs(np.asarray(out[0]) - ref)))
+    if err >= 1e-3:
+        diff = np.abs(np.asarray(out[0]) - ref)
+        bad = np.argwhere(diff >= 1e-3)
+        sample = bad[:5].tolist() if len(bad) > 0 else []
+        raise AssertionError(
+            f"max|err|={err:.4g} (>= 1e-3); {len(bad)} bad cells; "
+            f"first few: {sample}"
+        )
+
+
 def test_row_reduce_sum():
     """Validate NAXFrag32::row_reduce<Sum>: fill a 32x32 frag (in registers
     via explicit dr/dc loads) with v(r,c) = r*100 + c. Each row's sum should
@@ -625,6 +737,7 @@ def main():
         test_compile_smoke,
         test_mma_register_only,
         test_mma_via_tg_load_store,
+        test_mma_via_dv_load_store,
         test_row_reduce_sum,
     ]
     failed = 0
