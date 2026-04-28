@@ -836,7 +836,6 @@ bool is_nax_available() {
       can_use_nax = true;
     }
     auto& d = metal::device(mlx::core::Device::gpu);
-    auto arch = d.get_architecture().back();
     auto gen = d.get_architecture_gen();
     // Historical note: NAX was originally locked out on gen < 17 because
     // tools/probe_nax_descriptor.py showed that the (16,32,16) MPP descriptor
