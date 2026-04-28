@@ -22,8 +22,9 @@ void gemm_epilogue(
     const device T* C,
     const constant GEMMParams* params,
     const constant GEMMAddMMParams* addmm_params,
-    const short sgp_sm, 
-    const short sgp_sn) { // clang-format on
+    const short sgp_sm,
+    const short sgp_sn,
+    threadgroup typename NAXTile_t::elem_type* scratch = nullptr) { // clang-format on
 
   (void)params;
 
@@ -36,6 +37,11 @@ void gemm_epilogue(
   using CFrag = typename NAXTile_t::NAXFrag_t;
   using cfrag_t = typename CFrag::template dtype_frag_t<T>;
 
+  static_assert(
+      sizeof(V) >= sizeof(T),
+      "gemm_epilogue: AccumType must be >= sizeof(T) so the shared scratch "
+      "buffer can be safely cast to threadgroup T* for the C load.");
+
   const_for_loop<0, TM, 1>([&](auto mm) {
     const_for_loop<0, TN, 1>([&](auto nn) {
       auto m = mm * Int<CFrag::kFragRows>{};
@@ -43,18 +49,34 @@ void gemm_epilogue(
 
       cfrag_t celems;
 
-      if constexpr (kAlignedM && kAlignedN) {
-        CFrag::load(celems, C, addmm_params->ldc, addmm_params->fdc, m, n);
+      if constexpr (CFrag::kPacking == 1) {
+        // NAXFrag32 path: ld for the C view is the row stride (ldc).
+        // fdc is the inner-dim element stride; for NAXFrag32's contiguous
+        // load/safe-load, we need fdc == 1 — the cast and pointer arithmetic
+        // below assume that. test_blas exercises only fdc==1 for fused gemm.
+        if constexpr (kAlignedM && kAlignedN) {
+          CFrag::load(
+              celems,
+              C + m.value * addmm_params->ldc + n.value * addmm_params->fdc,
+              short(addmm_params->ldc));
+        } else {
+          CFrag::load_safe(
+              celems,
+              C + m.value * addmm_params->ldc + n.value * addmm_params->fdc,
+              addmm_params->ldc,
+              short(sgp_sm - m.value),
+              short(sgp_sn - n.value),
+              (threadgroup T*)scratch);
+        }
       } else {
-        CFrag::load_safe(
-            celems,
-            C,
-            addmm_params->ldc,
-            addmm_params->fdc,
-            sgp_sm,
-            sgp_sn,
-            m,
-            n);
+        // existing kPacking==2 (BaseNAXFrag) body — verbatim from before.
+        if constexpr (kAlignedM && kAlignedN) {
+          CFrag::load(celems, C, addmm_params->ldc, addmm_params->fdc, m, n);
+        } else {
+          CFrag::load_safe(
+              celems, C, addmm_params->ldc, addmm_params->fdc,
+              sgp_sm, sgp_sn, m, n);
+        }
       }
 
       thread auto& delems = Dtile.template frag_at<mm, nn>();
@@ -82,7 +104,8 @@ template <
     int WN,
     bool transpose_a,
     bool transpose_b,
-    typename AccumType = float>
+    typename AccumType = float,
+    class NAXFrag_ = mlx::steel::BaseNAXFrag>
 [[kernel, max_total_threads_per_threadgroup(WM* WN * 32)]] void gemm(
     const device T* A [[buffer(0)]],
     const device T* B [[buffer(1)]],
@@ -151,8 +174,12 @@ template <
   constexpr short SN = BN / WN;
   constexpr short SK = 32;
 
-  constexpr short TM = SM / 16;
-  constexpr short TN = SN / 16;
+  constexpr short TM = SM / NAXFrag_::kFragRows;
+  constexpr short TN = SN / NAXFrag_::kFragCols;
+  static_assert(SM % NAXFrag_::kFragRows == 0,
+                "SM must be a multiple of NAXFrag_::kFragRows");
+  static_assert(SN % NAXFrag_::kFragCols == 0,
+                "SN must be a multiple of NAXFrag_::kFragCols");
 
   const short tm = SM * (simd_group_id / WN);
   const short tn = SN * (simd_group_id % WN);
@@ -175,7 +202,21 @@ template <
     C += tm * addmm_params->ldc + tn * addmm_params->fdc;
   }
 
-  NAXTile<AccumType, TM, TN> Dtile;
+  NAXTile<AccumType, TM, TN, NAXFrag_> Dtile;
+
+  // Threadgroup scratch for the NAXFrag32 (kPacking==1) path. Each simdgroup
+  // gets its own 32x32 region used by NAXTile's safe/rows methods to stage
+  // device <-> register through the contiguous-tg cooperative-tensor load.
+  // Sized in AccumType; gemm_epilogue casts to `(threadgroup T*)` when loading
+  // C (sizeof(AccumType) >= sizeof(T) holds for all supported dtype combos and
+  // is asserted in gemm_epilogue).
+  // For BaseNAXFrag (kPacking==2), `1` keeps the array non-zero-sized (Metal
+  // rejects zero-sized threadgroup arrays); the BaseNAXFrag path never reads
+  // scratch_buf, so the 4-byte cost is negligible.
+  constexpr int kScratchSize = (NAXFrag_::kPacking == 1) ? (WM * WN * 32 * 32) : 1;
+  threadgroup AccumType scratch_buf[kScratchSize];
+  threadgroup AccumType* sg_scratch =
+      (NAXFrag_::kPacking == 1) ? (scratch_buf + simd_group_id * 1024) : nullptr;
 
   dispatch_bool(align_K, [&](auto kAlignedK) {
     dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {
@@ -202,12 +243,12 @@ template <
             sgp_sn);
         if (use_out_source) {
           gemm_epilogue<kAlignedM.value, kAlignedN.value>(
-              Dtile, C, params, addmm_params, sgp_sm, sgp_sn);
+              Dtile, C, params, addmm_params, sgp_sm, sgp_sn, sg_scratch);
         }
         if constexpr (kAlignedM && kAlignedN) {
           Dtile.store(D, int(params->ldd));
         } else {
-          Dtile.store_safe(D, int(params->ldd), short2(sgp_sn, sgp_sm));
+          Dtile.store_safe(D, int(params->ldd), short2(sgp_sn, sgp_sm), sg_scratch);
         }
       });
     });
