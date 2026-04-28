@@ -673,6 +673,245 @@ def test_mma_via_dv_load_store():
         )
 
 
+def test_load_safe_zero_fill():
+    """Validate NAXFrag32::load_safe: load a 32x32 matrix with bounds
+    (row_lim=20, col_lim=24). Elements outside the bounds should be zero-filled.
+    With B = identity, the result C should equal A masked to the (20, 24)
+    top-left rectangle, with zeros elsewhere.
+    """
+    src = """
+    using Frag = NAXFrag32;
+    threadgroup float scratch[32 * 32];
+    Frag::dtype_frag_t<float> a_frag, b_frag, c_frag;
+    Frag::load_safe(a_frag, (const device float*)A, 32, (short)20, (short)24, scratch);
+    Frag::load(b_frag, (const device float*)B, (short)32);
+    STEEL_PRAGMA_UNROLL
+    for (uint16_t i = 0; i < Frag::kElemsPerFrag; ++i) c_frag[i] = 0.0f;
+    Frag::mma(c_frag,
+              a_frag, metal::bool_constant<false>{},
+              b_frag, metal::bool_constant<false>{});
+    Frag::store(c_frag, (device float*)C, (short)32);
+    """
+    k = mx.fast.metal_kernel(
+        name="probe_naxfrag32_load_safe_zero_fill",
+        input_names=["A", "B"],
+        output_names=["C"],
+        source=src,
+        header=HEADER,
+    )
+    A_np = np.random.RandomState(0).randint(-3, 4, (32, 32)).astype(np.float32)
+    B_np = np.eye(32, dtype=np.float32)
+    A = mx.array(A_np)
+    B = mx.array(B_np)
+    out = k(
+        inputs=[A, B],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(32, 32)],
+        output_dtypes=[mx.float32],
+    )
+    mx.eval(out[0])
+    # Reference: A masked to top-left (20, 24), zeros outside.
+    ref = A_np.copy()
+    ref[20:, :] = 0.0
+    ref[:, 24:] = 0.0
+    err = float(np.max(np.abs(np.asarray(out[0]) - ref)))
+    if err >= 1e-3:
+        diff = np.abs(np.asarray(out[0]) - ref)
+        bad = np.argwhere(diff >= 1e-3)
+        sample = bad[:5].tolist() if len(bad) > 0 else []
+        raise AssertionError(
+            f"max|err|={err:.4g} (>= 1e-3); {len(bad)} bad cells; "
+            f"first few: {sample}"
+        )
+
+
+def test_load_rows_zero_fill():
+    """Validate NAXFrag32::load_rows: load a 32x32 matrix with row_lim=20.
+    Rows 20..31 should be zero-filled; all 32 columns are kept.
+    With B = identity, the result C should equal A with rows 20..31 zeroed.
+    """
+    src = """
+    using Frag = NAXFrag32;
+    threadgroup float scratch[32 * 32];
+    Frag::dtype_frag_t<float> a_frag, b_frag, c_frag;
+    Frag::load_rows(a_frag, (const device float*)A, 32, (short)20, scratch);
+    Frag::load(b_frag, (const device float*)B, (short)32);
+    STEEL_PRAGMA_UNROLL
+    for (uint16_t i = 0; i < Frag::kElemsPerFrag; ++i) c_frag[i] = 0.0f;
+    Frag::mma(c_frag,
+              a_frag, metal::bool_constant<false>{},
+              b_frag, metal::bool_constant<false>{});
+    Frag::store(c_frag, (device float*)C, (short)32);
+    """
+    k = mx.fast.metal_kernel(
+        name="probe_naxfrag32_load_rows_zero_fill",
+        input_names=["A", "B"],
+        output_names=["C"],
+        source=src,
+        header=HEADER,
+    )
+    A_np = np.random.RandomState(0).randint(-3, 4, (32, 32)).astype(np.float32)
+    B_np = np.eye(32, dtype=np.float32)
+    A = mx.array(A_np)
+    B = mx.array(B_np)
+    out = k(
+        inputs=[A, B],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(32, 32)],
+        output_dtypes=[mx.float32],
+    )
+    mx.eval(out[0])
+    # Reference: A with rows 20..31 zeroed.
+    ref = A_np.copy()
+    ref[20:, :] = 0.0
+    err = float(np.max(np.abs(np.asarray(out[0]) - ref)))
+    if err >= 1e-3:
+        diff = np.abs(np.asarray(out[0]) - ref)
+        bad = np.argwhere(diff >= 1e-3)
+        sample = bad[:5].tolist() if len(bad) > 0 else []
+        raise AssertionError(
+            f"max|err|={err:.4g} (>= 1e-3); {len(bad)} bad cells; "
+            f"first few: {sample}"
+        )
+
+
+def test_store_safe_skip_oob():
+    """Validate NAXFrag32::store_safe: store a matmul result with bounds
+    (row_lim=20, col_lim=24). Out-of-bounds elements should retain the
+    pre-filled sentinel value of -1.0. C[:20, :24] should match A[:20, :24]
+    (since B = identity), and C[20:, :] / C[:, 24:] should retain -1.0.
+    """
+    src = """
+    using Frag = NAXFrag32;
+
+    // Copy Cinit into C before the matmul so OOB regions start as -1.0.
+    uint tid = thread_position_in_threadgroup.x;
+    for (uint i = tid; i < 32*32; i += 32) ((device float*)C)[i] = ((const device float*)Cinit)[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float scratch[32 * 32];
+    Frag::dtype_frag_t<float> a_frag, b_frag, c_frag;
+    Frag::load(a_frag, (const device float*)A, (short)32);
+    Frag::load(b_frag, (const device float*)B, (short)32);
+    STEEL_PRAGMA_UNROLL
+    for (uint16_t i = 0; i < Frag::kElemsPerFrag; ++i) c_frag[i] = 0.0f;
+    Frag::mma(c_frag,
+              a_frag, metal::bool_constant<false>{},
+              b_frag, metal::bool_constant<false>{});
+    Frag::store_safe(c_frag, (device float*)C, 32, (short)20, (short)24, scratch);
+    """
+    k = mx.fast.metal_kernel(
+        name="probe_naxfrag32_store_safe_skip_oob",
+        input_names=["A", "B", "Cinit"],
+        output_names=["C"],
+        source=src,
+        header=HEADER,
+    )
+    A_np = np.random.RandomState(0).randint(-3, 4, (32, 32)).astype(np.float32)
+    B_np = np.eye(32, dtype=np.float32)
+    Cinit_np = np.full((32, 32), -1.0, dtype=np.float32)
+    A = mx.array(A_np)
+    B = mx.array(B_np)
+    Cinit = mx.array(Cinit_np)
+    out = k(
+        inputs=[A, B, Cinit],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(32, 32)],
+        output_dtypes=[mx.float32],
+    )
+    mx.eval(out[0])
+    result = np.asarray(out[0])
+
+    # Build reference: A @ B = A (identity B), store only in [:20, :24].
+    # The rest should remain -1.0.
+    ref = Cinit_np.copy()
+    ref[:20, :24] = A_np[:20, :24]  # A @ I = A
+
+    err = float(np.max(np.abs(result - ref)))
+    if err >= 1e-3:
+        diff = np.abs(result - ref)
+        bad = np.argwhere(diff >= 1e-3)
+        sample = bad[:5].tolist() if len(bad) > 0 else []
+        # Extra diagnostics: check if OOB sentinel was overwritten.
+        oob_rows_changed = np.any(result[20:, :] != -1.0)
+        oob_cols_changed = np.any(result[:, 24:] != -1.0)
+        raise AssertionError(
+            f"max|err|={err:.4g} (>= 1e-3); {len(bad)} bad cells; "
+            f"first few: {sample}; "
+            f"OOB rows[20:] overwritten={oob_rows_changed}; "
+            f"OOB cols[24:] overwritten={oob_cols_changed}"
+        )
+
+
+def test_store_rows_skip_oob():
+    """Validate NAXFrag32::store_rows: store a matmul result with row_lim=20.
+    Rows 20..31 should retain the pre-filled sentinel value of -1.0.
+    C[:20, :] should match A[:20, :] (since B = identity).
+    """
+    src = """
+    using Frag = NAXFrag32;
+
+    // Copy Cinit into C before the matmul so OOB regions start as -1.0.
+    uint tid = thread_position_in_threadgroup.x;
+    for (uint i = tid; i < 32*32; i += 32) ((device float*)C)[i] = ((const device float*)Cinit)[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float scratch[32 * 32];
+    Frag::dtype_frag_t<float> a_frag, b_frag, c_frag;
+    Frag::load(a_frag, (const device float*)A, (short)32);
+    Frag::load(b_frag, (const device float*)B, (short)32);
+    STEEL_PRAGMA_UNROLL
+    for (uint16_t i = 0; i < Frag::kElemsPerFrag; ++i) c_frag[i] = 0.0f;
+    Frag::mma(c_frag,
+              a_frag, metal::bool_constant<false>{},
+              b_frag, metal::bool_constant<false>{});
+    Frag::store_rows(c_frag, (device float*)C, 32, (short)20, scratch);
+    """
+    k = mx.fast.metal_kernel(
+        name="probe_naxfrag32_store_rows_skip_oob",
+        input_names=["A", "B", "Cinit"],
+        output_names=["C"],
+        source=src,
+        header=HEADER,
+    )
+    A_np = np.random.RandomState(0).randint(-3, 4, (32, 32)).astype(np.float32)
+    B_np = np.eye(32, dtype=np.float32)
+    Cinit_np = np.full((32, 32), -1.0, dtype=np.float32)
+    A = mx.array(A_np)
+    B = mx.array(B_np)
+    Cinit = mx.array(Cinit_np)
+    out = k(
+        inputs=[A, B, Cinit],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(32, 32)],
+        output_dtypes=[mx.float32],
+    )
+    mx.eval(out[0])
+    result = np.asarray(out[0])
+
+    # Build reference: A @ B = A (identity B), store only rows [:20].
+    # Rows [20:] should remain -1.0.
+    ref = Cinit_np.copy()
+    ref[:20, :] = A_np[:20, :]  # A @ I = A
+
+    err = float(np.max(np.abs(result - ref)))
+    if err >= 1e-3:
+        diff = np.abs(result - ref)
+        bad = np.argwhere(diff >= 1e-3)
+        sample = bad[:5].tolist() if len(bad) > 0 else []
+        # Extra diagnostics: check if OOB sentinel was overwritten.
+        oob_rows_changed = np.any(result[20:, :] != -1.0)
+        raise AssertionError(
+            f"max|err|={err:.4g} (>= 1e-3); {len(bad)} bad cells; "
+            f"first few: {sample}; "
+            f"OOB rows[20:] overwritten={oob_rows_changed}"
+        )
+
+
 def test_row_reduce_sum():
     """Validate NAXFrag32::row_reduce<Sum>: fill a 32x32 frag (in registers
     via explicit dr/dc loads) with v(r,c) = r*100 + c. Each row's sum should
@@ -738,6 +977,10 @@ def main():
         test_mma_register_only,
         test_mma_via_tg_load_store,
         test_mma_via_dv_load_store,
+        test_load_safe_zero_fill,
+        test_load_rows_zero_fill,
+        test_store_safe_skip_oob,
+        test_store_rows_skip_oob,
         test_row_reduce_sum,
     ]
     failed = 0
