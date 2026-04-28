@@ -1108,114 +1108,223 @@ struct NAXTile {
 
   template <typename U>
   METAL_FUNC void load(const device U* src, const int ld) {
-    const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
-      const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
-        NAXFrag_t::load(
-            frag_at<idx_row.value, idx_col.value>(),
-            src,
-            ld,
-            Int<1>{},
-            idx_row * Int<kFragRows>{},
-            idx_col * Int<kFragCols>{});
+    if constexpr (NAXFrag_t::kPacking == 1) {
+      // kPacking==1 path: NAXFrag32 takes a per-frag base pointer + ld.
+      const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+        const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+          constexpr short m_off = idx_row.value * kFragRows;
+          constexpr short n_off = idx_col.value * kFragCols;
+          NAXFrag_t::load(
+              frag_at<idx_row.value, idx_col.value>(),
+              src + m_off * ld + n_off,
+              short(ld));
+        });
       });
-    });
+    } else {
+      const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+        const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+          NAXFrag_t::load(
+              frag_at<idx_row.value, idx_col.value>(),
+              src,
+              ld,
+              Int<1>{},
+              idx_row * Int<kFragRows>{},
+              idx_col * Int<kFragCols>{});
+        });
+      });
+    }
   }
 
   template <typename U>
   METAL_FUNC void store(device U* dst, const int ld) const {
-    const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
-      const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
-        NAXFrag_t::store(
-            frag_at<idx_row.value, idx_col.value>(),
-            dst,
-            ld,
-            Int<1>{},
-            idx_row * Int<kFragRows>{},
-            idx_col * Int<kFragCols>{});
+    if constexpr (NAXFrag_t::kPacking == 1) {
+      // kPacking==1 path: NAXFrag32 takes a per-frag base pointer + ld.
+      const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+        const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+          constexpr short m_off = idx_row.value * kFragRows;
+          constexpr short n_off = idx_col.value * kFragCols;
+          NAXFrag_t::store(
+              frag_at<idx_row.value, idx_col.value>(),
+              dst + m_off * ld + n_off,
+              short(ld));
+        });
       });
-    });
+    } else {
+      const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+        const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+          NAXFrag_t::store(
+              frag_at<idx_row.value, idx_col.value>(),
+              dst,
+              ld,
+              Int<1>{},
+              idx_row * Int<kFragRows>{},
+              idx_col * Int<kFragCols>{});
+        });
+      });
+    }
   }
 
   template <typename U>
   METAL_FUNC void
-  load_rows(const device U* src, const int ld, const short n_rows) {
-    const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
-      const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
-        // TODO(nax-g16-fix): NAXFrag32's load_safe/load_rows/store_safe/store_rows
-        // require an extra `threadgroup T* scratch` parameter (see NAXFrag32
-        // struct header). Phase 2 / Task 2.2 must redesign this dispatch.
-        NAXFrag_t::load_rows(
-            frag_at<idx_row.value, idx_col.value>(),
-            src,
-            ld,
-            Int<1>{},
-            n_rows,
-            idx_row * Int<kFragRows>{},
-            idx_col * Int<kFragCols>{});
+  load_rows(const device U* src, const int ld, const short n_rows,
+            threadgroup elem_type* scratch = nullptr) {
+    if constexpr (NAXFrag_t::kPacking == 1) {
+      // kPacking==1 path: stages via NAXFrag32::load_rows scratch machinery.
+      const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+        const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+          constexpr short m_off = idx_row.value * kFragRows;
+          constexpr short n_off = idx_col.value * kFragCols;
+          // Per-frag row bound clamped to [0, kFragRows].
+          const short rl = max(short(0),
+                               min(short(kFragRows), short(n_rows - m_off)));
+          NAXFrag_t::load_rows(
+              frag_at<idx_row.value, idx_col.value>(),
+              src + m_off * ld + n_off,
+              ld,
+              rl,
+              scratch);
+        });
       });
-    });
+    } else {
+      // kPacking==2 (BaseNAXFrag) path: unchanged; scratch param ignored.
+      const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+        const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+          NAXFrag_t::load_rows(
+              frag_at<idx_row.value, idx_col.value>(),
+              src,
+              ld,
+              Int<1>{},
+              n_rows,
+              idx_row * Int<kFragRows>{},
+              idx_col * Int<kFragCols>{});
+        });
+      });
+    }
   }
 
   template <typename U>
   METAL_FUNC void
-  load_safe(const device U* src, const int ld, const short2 src_tile_dims) {
-    const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
-      const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
-        // TODO(nax-g16-fix): NAXFrag32's load_safe/load_rows/store_safe/store_rows
-        // require an extra `threadgroup T* scratch` parameter (see NAXFrag32
-        // struct header). Phase 2 / Task 2.2 must redesign this dispatch.
-        NAXFrag_t::load_safe(
-            frag_at<idx_row.value, idx_col.value>(),
-            src,
-            ld,
-            Int<1>{},
-            src_tile_dims.y,
-            src_tile_dims.x,
-            idx_row * Int<kFragRows>{},
-            idx_col * Int<kFragCols>{});
+  load_safe(const device U* src, const int ld, const short2 src_tile_dims,
+            threadgroup elem_type* scratch = nullptr) {
+    if constexpr (NAXFrag_t::kPacking == 1) {
+      // kPacking==1 path: stages via NAXFrag32::load_safe scratch machinery.
+      const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+        const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+          constexpr short m_off = idx_row.value * kFragRows;
+          constexpr short n_off = idx_col.value * kFragCols;
+          // Per-frag row/col bounds clamped to [0, kFragRows/kFragCols].
+          const short rl = max(short(0),
+                               min(short(kFragRows),
+                                   short(src_tile_dims.y - m_off)));
+          const short cl = max(short(0),
+                               min(short(kFragCols),
+                                   short(src_tile_dims.x - n_off)));
+          NAXFrag_t::load_safe(
+              frag_at<idx_row.value, idx_col.value>(),
+              src + m_off * ld + n_off,
+              ld,
+              rl,
+              cl,
+              scratch);
+        });
       });
-    });
+    } else {
+      // kPacking==2 (BaseNAXFrag) path: unchanged; scratch param ignored.
+      const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+        const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+          NAXFrag_t::load_safe(
+              frag_at<idx_row.value, idx_col.value>(),
+              src,
+              ld,
+              Int<1>{},
+              src_tile_dims.y,
+              src_tile_dims.x,
+              idx_row * Int<kFragRows>{},
+              idx_col * Int<kFragCols>{});
+        });
+      });
+    }
   }
 
   template <typename U>
-  METAL_FUNC void store_rows(device U* dst, const int ld, const short n_rows)
-      const {
-    const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
-      const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
-        // TODO(nax-g16-fix): NAXFrag32's load_safe/load_rows/store_safe/store_rows
-        // require an extra `threadgroup T* scratch` parameter (see NAXFrag32
-        // struct header). Phase 2 / Task 2.2 must redesign this dispatch.
-        NAXFrag_t::store_rows(
-            frag_at<idx_row.value, idx_col.value>(),
-            dst,
-            ld,
-            Int<1>{},
-            n_rows,
-            idx_row * Int<kFragRows>{},
-            idx_col * Int<kFragCols>{});
+  METAL_FUNC void store_rows(device U* dst, const int ld, const short n_rows,
+                             threadgroup elem_type* scratch = nullptr) const {
+    if constexpr (NAXFrag_t::kPacking == 1) {
+      // kPacking==1 path: stages via NAXFrag32::store_rows scratch machinery.
+      const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+        const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+          constexpr short m_off = idx_row.value * kFragRows;
+          constexpr short n_off = idx_col.value * kFragCols;
+          // Per-frag row bound clamped to [0, kFragRows].
+          const short rl = max(short(0),
+                               min(short(kFragRows), short(n_rows - m_off)));
+          NAXFrag_t::store_rows(
+              frag_at<idx_row.value, idx_col.value>(),
+              dst + m_off * ld + n_off,
+              ld,
+              rl,
+              scratch);
+        });
       });
-    });
+    } else {
+      // kPacking==2 (BaseNAXFrag) path: unchanged; scratch param ignored.
+      const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+        const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+          NAXFrag_t::store_rows(
+              frag_at<idx_row.value, idx_col.value>(),
+              dst,
+              ld,
+              Int<1>{},
+              n_rows,
+              idx_row * Int<kFragRows>{},
+              idx_col * Int<kFragCols>{});
+        });
+      });
+    }
   }
 
   template <typename U>
   METAL_FUNC void
-  store_safe(device U* dst, const int ld, const short2 dst_tile_dims) const {
-    const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
-      const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
-        // TODO(nax-g16-fix): NAXFrag32's load_safe/load_rows/store_safe/store_rows
-        // require an extra `threadgroup T* scratch` parameter (see NAXFrag32
-        // struct header). Phase 2 / Task 2.2 must redesign this dispatch.
-        NAXFrag_t::store_safe(
-            frag_at<idx_row.value, idx_col.value>(),
-            dst,
-            ld,
-            Int<1>{},
-            dst_tile_dims.y,
-            dst_tile_dims.x,
-            idx_row * Int<kFragRows>{},
-            idx_col * Int<kFragCols>{});
+  store_safe(device U* dst, const int ld, const short2 dst_tile_dims,
+             threadgroup elem_type* scratch = nullptr) const {
+    if constexpr (NAXFrag_t::kPacking == 1) {
+      // kPacking==1 path: stages via NAXFrag32::store_safe scratch machinery.
+      const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+        const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+          constexpr short m_off = idx_row.value * kFragRows;
+          constexpr short n_off = idx_col.value * kFragCols;
+          // Per-frag row/col bounds clamped to [0, kFragRows/kFragCols].
+          const short rl = max(short(0),
+                               min(short(kFragRows),
+                                   short(dst_tile_dims.y - m_off)));
+          const short cl = max(short(0),
+                               min(short(kFragCols),
+                                   short(dst_tile_dims.x - n_off)));
+          NAXFrag_t::store_safe(
+              frag_at<idx_row.value, idx_col.value>(),
+              dst + m_off * ld + n_off,
+              ld,
+              rl,
+              cl,
+              scratch);
+        });
       });
-    });
+    } else {
+      // kPacking==2 (BaseNAXFrag) path: unchanged; scratch param ignored.
+      const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+        const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+          NAXFrag_t::store_safe(
+              frag_at<idx_row.value, idx_col.value>(),
+              dst,
+              ld,
+              Int<1>{},
+              dst_tile_dims.y,
+              dst_tile_dims.x,
+              idx_row * Int<kFragRows>{},
+              idx_col * Int<kFragCols>{});
+        });
+      });
+    }
   }
 
   template <typename U>
