@@ -695,6 +695,121 @@ struct NAXFrag32 {
         view((threadgroup U*)dst, ext);
     ct.store(view);
   }
+
+  // Load a 32x32 frag from device memory, zero-fill out-of-bounds elements.
+  // Strategy B: caller provides a threadgroup scratch buffer (32*32 elements).
+  // Each lane fills its slice of the staging buffer with bounds-checked copies
+  // from device, then calls the cooperative-tensor load on the staged data.
+  // Avoids depending on MPP partial-tile support that does not exist on this
+  // SDK (only tensor_inline/tensor_handle/tensor_offset exist — no padded or
+  // strided bounded-view types); per-thread layout still owned by the
+  // cooperative tensor inside load().
+  // Note: threadgroup scratch cannot be declared inside a device function in
+  // Metal; callers must allocate `threadgroup T scratch[32*32]` and pass it.
+  template <typename T, typename U>
+  METAL_FUNC static void load_safe(
+      thread dtype_frag_t<T>& dst,
+      const device U* src,
+      const int ld,
+      const short row_lim,
+      const short col_lim,
+      threadgroup T* scratch) {
+    const ushort lane = __metal_get_thread_index_in_simdgroup(ushort());
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemsPerFrag; ++i) {
+      const short flat = lane * kElemsPerFrag + i;
+      const short r = flat / 32;
+      const short c = flat % 32;
+      scratch[r * 32 + c] =
+          (r < row_lim && c < col_lim) ? static_cast<T>(src[r * ld + c]) : T(0);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    load(dst, scratch, /*ld=*/short(32));
+  }
+
+  // Load a 32x32 frag from device memory with a row bound only; columns are
+  // always treated as full 32. Zero-fills rows at or beyond row_lim.
+  // Caller must allocate `threadgroup T scratch[32*32]` and pass it.
+  template <typename T, typename U>
+  METAL_FUNC static void load_rows(
+      thread dtype_frag_t<T>& dst,
+      const device U* src,
+      const int ld,
+      const short row_lim,
+      threadgroup T* scratch) {
+    const ushort lane = __metal_get_thread_index_in_simdgroup(ushort());
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemsPerFrag; ++i) {
+      const short flat = lane * kElemsPerFrag + i;
+      const short r = flat / 32;
+      const short c = flat % 32;
+      scratch[r * 32 + c] =
+          (r < row_lim) ? static_cast<T>(src[r * ld + c]) : T(0);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    load(dst, scratch, /*ld=*/short(32));
+  }
+
+  // Store a 32x32 frag to device memory, skipping elements out-of-bounds.
+  // Caller must allocate `threadgroup T scratch[32*32]` and pass it.
+  template <typename T, typename U>
+  METAL_FUNC static void store_safe(
+      const thread dtype_frag_t<T>& src,
+      device U* dst,
+      const int ld,
+      const short row_lim,
+      const short col_lim,
+      threadgroup T* scratch) {
+    store(src, scratch, /*ld=*/short(32));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const ushort lane = __metal_get_thread_index_in_simdgroup(ushort());
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemsPerFrag; ++i) {
+      const short flat = lane * kElemsPerFrag + i;
+      const short r = flat / 32;
+      const short c = flat % 32;
+      if (r < row_lim && c < col_lim) {
+        dst[r * ld + c] = static_cast<U>(scratch[r * 32 + c]);
+      }
+    }
+  }
+
+  // Store a 32x32 frag to device memory with a row bound only; skips rows at
+  // or beyond row_lim. Columns always written for valid rows.
+  // Caller must allocate `threadgroup T scratch[32*32]` and pass it.
+  template <typename T, typename U>
+  METAL_FUNC static void store_rows(
+      const thread dtype_frag_t<T>& src,
+      device U* dst,
+      const int ld,
+      const short row_lim,
+      threadgroup T* scratch) {
+    store(src, scratch, /*ld=*/short(32));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const ushort lane = __metal_get_thread_index_in_simdgroup(ushort());
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemsPerFrag; ++i) {
+      const short flat = lane * kElemsPerFrag + i;
+      const short r = flat / 32;
+      const short c = flat % 32;
+      if (r < row_lim) {
+        dst[r * ld + c] = static_cast<U>(scratch[r * 32 + c]);
+      }
+    }
+  }
+
+  // store_slice is only used by the SDPA path (Phase 5). Leaving it out for
+  // now so callers who reach for it on g16s fail at compile time rather than
+  // silently produce wrong output.
+  template <typename T, typename... Args>
+  METAL_FUNC static void store_slice(
+      const thread dtype_frag_t<T>&,
+      device T*,
+      Args...) {
+    static_assert(
+        sizeof(T) < 0,
+        "NAXFrag32::store_slice not yet implemented; Phase 5 SDPA needs this");
+  }
 };
 
 template <
