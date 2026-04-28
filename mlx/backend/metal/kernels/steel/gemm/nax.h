@@ -1214,7 +1214,24 @@ METAL_FUNC void tile_matmad_nax(
   constexpr auto ta = metal::bool_constant<transpose_a>{};
   constexpr auto tb = metal::bool_constant<transpose_b>{};
 
-  if constexpr (TN == 1 && TM % 2 == 0) {
+  if constexpr (CTile::NAXFrag_t::kPacking == 1) {
+    // Single-frag mma: one 32x32 output per MMA. Used by NAXFrag32 (g16 path).
+    STEEL_PRAGMA_UNROLL
+    for (short mm = 0; mm < TM; ++mm) {
+      STEEL_PRAGMA_UNROLL
+      for (short nn = 0; nn < TN; ++nn) {
+        STEEL_PRAGMA_UNROLL
+        for (short kk = 0; kk < TK; ++kk) {
+          CTile::NAXFrag_t::mma(
+              C.frag_at(mm, nn),
+              A.frag_at(mm, kk, ta),
+              metal::bool_constant<transpose_a>{},
+              B.frag_at(kk, nn, tb),
+              metal::bool_constant<transpose_b>{});
+        }
+      }
+    }
+  } else if constexpr (TN == 1 && TM % 2 == 0) {
     STEEL_PRAGMA_UNROLL
     for (short mm = 0; mm < TM; mm += 2) {
       STEEL_PRAGMA_UNROLL
