@@ -636,6 +636,65 @@ struct NAXFrag32 {
       C[i] = ct_c[i];
     }
   }
+
+  // Load the entire 32x32 frag from a contiguous threadgroup region.
+  // Materializes a tensor_inline view over the threadgroup pointer and uses
+  // the cooperative-tensor load that the MPP runtime handles. Avoids
+  // hard-coding (dr, dc) per-thread offsets — same code path as
+  // tools/probe_nax_descriptor.py's tg-staged variant, which empirically
+  // verifies max|err| = 0 for the (32, 32, 32) descriptor on g16s.
+  template <typename T, typename U>
+  METAL_FUNC static void load(
+      thread dtype_frag_t<T>& dst,
+      const threadgroup U* src,
+      const short ld) {
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+        32, 32, 32,
+        /*transpose_left=*/false,
+        /*transpose_right=*/false,
+        /*relaxed_precision=*/true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+    auto ct = op.template get_left_input_cooperative_tensor<T, T, T>();
+
+    metal::dextents<int32_t, 2> ext(32, ld);
+    metal::tensor<threadgroup const U, metal::dextents<int32_t, 2>, metal::tensor_inline>
+        view((threadgroup const U*)src, ext);
+    ct.load(view);
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemsPerFrag; i++) {
+      dst[i] = static_cast<T>(ct[i]);
+    }
+  }
+
+  template <typename T, typename U>
+  METAL_FUNC static void store(
+      const thread dtype_frag_t<T>& src,
+      threadgroup U* dst,
+      const short ld) {
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+        32, 32, 32,
+        /*transpose_left=*/false,
+        /*transpose_right=*/false,
+        /*relaxed_precision=*/true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+    auto ct = op.template get_destination_cooperative_tensor<
+        decltype(op.template get_left_input_cooperative_tensor<T, T, T>()),
+        decltype(op.template get_right_input_cooperative_tensor<T, T, T>()),
+        T>();
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemsPerFrag; i++) {
+      ct[i] = static_cast<T>(src[i]);
+    }
+
+    metal::dextents<int32_t, 2> ext(32, ld);
+    metal::tensor<threadgroup U, metal::dextents<int32_t, 2>, metal::tensor_inline>
+        view((threadgroup U*)dst, ext);
+    ct.store(view);
+  }
 };
 
 template <
