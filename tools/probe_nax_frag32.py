@@ -63,8 +63,8 @@ struct NAXFrag32 {
 
   STEEL_CONST short kElemsPerFrag = (kFragRows * kFragCols) / 32;  // 32
 
-  STEEL_CONST short kElemRows = 8;
-  STEEL_CONST short kElemCols = 4;
+  STEEL_CONST short kElemRows = 4;
+  STEEL_CONST short kElemCols = 8;
 
   // NAXFrag32's per-thread row layout is non-uniform (dr_table =
   // {0,1,8,9,16,17,24,25}) — there is no valid constant stride. We set this
@@ -320,6 +320,51 @@ struct NAXFrag32 {
     }
   }
 
+  // Row reduction: combine all 32 column elements in each of the thread's
+  // 4 owned rows. Each row is shared by 4 lanes (those with the same
+  // row_base, varying col_base). Lane bits 0 and 3 vary across these 4
+  // lanes; bits 1, 2, 4 are constant. Within each thread, 8 col elements
+  // per row at indices [row*8 .. row*8+7].
+  template <typename Op, typename T>
+  METAL_FUNC static constexpr void row_reduce(
+      thread const dtype_frag_t<T>& inp_vals,
+      thread T* reduced_vals) {
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemRows; i++) {
+      // Within-thread reduction: combine the 8 col elements for this row.
+      T thr_reduce = inp_vals[i * kElemCols + 0];
+      STEEL_PRAGMA_UNROLL
+      for (short j = 1; j < kElemCols; j++) {
+        thr_reduce = Op::apply(thr_reduce, inp_vals[i * kElemCols + j]);
+      }
+
+      // Cross-lane: combine 4 lanes sharing this row_base. Lanes differ
+      // only in bits 0 and 3 of the simd lane id.
+      T shuf1 = simd_shuffle_xor(thr_reduce, ushort(1));
+      thr_reduce = Op::apply(thr_reduce, shuf1);
+      T shuf8 = simd_shuffle_xor(thr_reduce, ushort(8));
+      thr_reduce = Op::apply(thr_reduce, shuf8);
+
+      reduced_vals[i] = Op::apply(reduced_vals[i], thr_reduce);
+    }
+  }
+
+  // Apply a binary op between each row's elements and a per-row scalar.
+  // dtype_frag_t element ordering: row i lives at indices [i*8 .. i*8+7].
+  template <typename Op, typename T>
+  METAL_FUNC static constexpr void row_bin_op(
+      thread dtype_frag_t<T>& inp_vals,
+      thread T* row_vals) {
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemRows; i++) {
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < kElemCols; j++) {
+        inp_vals[i * kElemCols + j] =
+            Op::apply(inp_vals[i * kElemCols + j], row_vals[i]);
+      }
+    }
+  }
+
   // store_slice is only used by the SDPA path (Phase 5). Leaving it out for
   // now so callers who reach for it on g16s fail at compile time rather than
   // silently produce wrong output. Variadic over all arguments so any caller
@@ -516,8 +561,72 @@ def test_mma_via_tg_load_store():
         )
 
 
+def test_row_reduce_sum():
+    """Validate NAXFrag32::row_reduce<Sum>: fill a 32x32 frag (in registers
+    via explicit dr/dc loads) with v(r,c) = r*100 + c. Each row's sum should
+    be 32*(r*100) + sum(0..31) = 3200*r + 496.
+    """
+    src = """
+    using Frag = NAXFrag32;
+    using T = float;
+
+    short2 base = Frag::get_coord();
+    Frag::dtype_frag_t<T> inp;
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < 32; ++i) {
+        short2 d = Frag::dr_dc(i);
+        short row = base.y + d.y;
+        short col = base.x + d.x;
+        inp[i] = (T)(row * 100 + col);
+    }
+
+    struct Sum { static T apply(T a, T b) { return a + b; } };
+    T row_sums[4] = {0, 0, 0, 0};
+    Frag::row_reduce<Sum>(inp, row_sums);
+
+    constexpr short dr_table[4] = {0, 8, 16, 24};
+    STEEL_PRAGMA_UNROLL
+    for (short r = 0; r < 4; ++r) {
+        short abs_row = base.y + dr_table[r];
+        out[abs_row] = row_sums[r];
+    }
+    """
+    k = mx.fast.metal_kernel(
+        name="probe_naxfrag32_row_reduce_sum",
+        input_names=[],
+        output_names=["out"],
+        source=src,
+        header=HEADER,
+    )
+    res = k(
+        inputs=[],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(32,)],
+        output_dtypes=[mx.float32],
+    )
+    mx.eval(res[0])
+    arr = np.asarray(res[0])
+    expected = np.array([3200.0 * r + 496.0 for r in range(32)])
+    err = float(np.max(np.abs(arr - expected)))
+    if err >= 1e-3:
+        diff = np.abs(arr - expected)
+        bad = np.argwhere(diff >= 1e-3)
+        sample = bad[:5].tolist() if len(bad) > 0 else []
+        raise AssertionError(
+            f"max|err|={err:.4g}; {len(bad)} bad rows; first few: {sample}; "
+            f"got[:4]={arr[:4].tolist()}, expected[:4]={expected[:4].tolist()}"
+        )
+
+
 def main():
-    tests = [test_compile_smoke, test_mma_register_only, test_mma_via_tg_load_store]
+    tests = [
+        test_compile_smoke,
+        test_mma_register_only,
+        test_mma_via_tg_load_store,
+        test_row_reduce_sum,
+    ]
     failed = 0
     for t in tests:
         try:
