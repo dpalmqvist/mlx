@@ -23,10 +23,12 @@ We picked staging at the NAXTile level (Approach B in the brainstorm) because it
 
 The contract:
 
-- **NAXFrag32** stays a register-and-contiguous abstraction. It owns its layout, its per-thread element ordering, and its `mma`. Its only I/O surface is `(load|store)(threadgroup|device const? U*, short ld)` — contiguous, full-frag, no offsets, no bounds.
-- **NAXTile** owns scratch-and-stage choreography. For `kPacking == 1` (NAXFrag32) callers, every safe/rows method takes a `threadgroup T* scratch` parameter, stages device↔scratch with bounds masking, and forwards to NAXFrag32's contiguous load/store.
+- **NAXFrag32** owns its layout, per-thread element ordering, `mma`, and (per Phase 1, commit `47379949`) the `load_safe` / `load_rows` / `store_safe` / `store_rows` family. The safe/rows methods take a `threadgroup T* scratch` parameter and stage device↔scratch internally using a row-per-lane fill pattern, then call the contiguous threadgroup `load`/`store` for the cooperative-tensor round-trip. **(Phase 2 adds device-pointer overloads of the contiguous `load`/`store` for the aligned path; the safe/rows surface is unchanged from Phase 1.)**
+- **NAXTile** dispatches on `kPacking`. For `kPacking == 1` (NAXFrag32) callers, every method takes a `threadgroup T* scratch = nullptr` parameter and forwards it to the corresponding NAXFrag32 method — including the previously implicit-TODO aligned `load`/`store` whose signatures don't currently match NAXFrag32 either.
 - **The kernel** owns scratch sizing, allocation, and per-simdgroup base-pointer computation. It also owns the template parameterization on the frag class.
 - **The host dispatcher** owns kernel-name selection — append `_g16` to the kname when `nax_arch_flavor() == kG16`.
+
+**Reconciliation with the implementation plan:** Section 2 of this spec (NAXTile dispatch) was originally drafted assuming staging happened at the NAXTile layer. Phase 1 already located the staging inside NAXFrag32's safe methods, so the corresponding plan task forwards scratch through NAXTile to NAXFrag32 rather than open-coding the lane-cooperative copy at the NAXTile layer. The kernel allocator, the call sites, and the validation gates are all unchanged.
 
 Five files change, in dependency order:
 
