@@ -367,8 +367,77 @@ def test_compile_smoke():
         raise AssertionError(f"Constants mismatch: got {arr.tolist()}, expected {expected.tolist()}")
 
 
+def test_mma_register_only():
+    """Register-only mma correctness: explicit dr/dc loads → NAXFrag32::mma →
+    explicit dr/dc stores. Isolates mma itself from the load/store I/O path.
+
+    Per spec, dtype_frag_t element i lives at (a + dr[i % 8], b + dc[i / 8])
+    where (b, a) is get_coord() (returned as short2{col, row}).
+    """
+    src = """
+    constexpr int M = 32, N = 32, K = 32;
+    using Frag = NAXFrag32;
+
+    short2 base = Frag::get_coord();              // {col_base, row_base}
+    Frag::dtype_frag_t<float> a_frag, b_frag, c_frag;
+
+    // Explicit dr/dc load — no NAXFrag32::load here.
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < 32; ++i) {
+        short2 d = Frag::dr_dc(i);                // {col_off, row_off}
+        short row = base.y + d.y;
+        short col = base.x + d.x;
+        a_frag[i] = A[row * K + col];
+        b_frag[i] = B[row * N + col];
+        c_frag[i] = 0.0f;
+    }
+
+    Frag::mma(c_frag,
+              a_frag, metal::bool_constant<false>{},
+              b_frag, metal::bool_constant<false>{});
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < 32; ++i) {
+        short2 d = Frag::dr_dc(i);
+        short row = base.y + d.y;
+        short col = base.x + d.x;
+        C[row * N + col] = c_frag[i];
+    }
+    """
+    k = mx.fast.metal_kernel(
+        name="probe_naxfrag32_mma_register_only",
+        input_names=["A", "B"],
+        output_names=["C"],
+        source=src,
+        header=HEADER,
+    )
+    A_np = np.random.RandomState(0).randint(-3, 4, (32, 32)).astype(np.float32)
+    B_np = np.random.RandomState(1).randint(-3, 4, (32, 32)).astype(np.float32)
+    A = mx.array(A_np)
+    B = mx.array(B_np)
+    out = k(
+        inputs=[A, B],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(32, 32)],
+        output_dtypes=[mx.float32],
+    )
+    mx.eval(out[0])
+    ref = A_np @ B_np
+    err = float(np.max(np.abs(np.asarray(out[0]) - ref)))
+    if err >= 1e-3:
+        # Print which positions differ — helps debug layout vs mma issues.
+        diff = np.abs(np.asarray(out[0]) - ref)
+        bad = np.argwhere(diff >= 1e-3)
+        sample = bad[:5].tolist() if len(bad) > 0 else []
+        raise AssertionError(
+            f"max|err|={err:.4g} (>= 1e-3); {len(bad)} bad cells; "
+            f"first few: {sample}"
+        )
+
+
 def main():
-    tests = [test_compile_smoke]
+    tests = [test_compile_smoke, test_mma_register_only]
     failed = 0
     for t in tests:
         try:
