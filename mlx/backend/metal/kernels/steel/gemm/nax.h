@@ -534,9 +534,28 @@ struct BaseNAXFrag {
 
 ///////////////////////////////////////////////////////////////////////////////
 // NAXFrag32 — 32x32 frag, single-frag MMA, layout-agnostic I/O via
-// tensor_inline. Used on g16 (M4 Pro), where matmul2d is only correct for
-// the (32, 32, 32) descriptor. See
-// docs/superpowers/specs/2026-04-27-nax-g16-fix-plan.md.
+// metal::tensor_inline. Used on g16 (M4 Pro), where matmul2d is only correct
+// for the (32, 32, 32) descriptor.
+//
+// I/O strategy (chosen during Task 1.5 of the NAX g16 fix):
+//   The Metal SDK exposes only `tensor_inline`, `tensor_handle`, and
+//   `tensor_offset` access kinds — no `tensor_padded` or strided/bounded
+//   variants. Cooperative tensors have no masked-load entry points. So
+//   "Strategy A" (route safe/rows variants through an MPP-bounded view) is
+//   infeasible on this SDK. We use "Strategy B": the safe/rows variants
+//   stage through a 32x32 threadgroup scratch buffer with a cooperative
+//   bounds-checked copy, then route through the contiguous load/store.
+//
+//   Metal forbids declaring `threadgroup T buf[N]` inside non-kernel
+//   device functions. So load_safe/load_rows/store_safe/store_rows take an
+//   extra `threadgroup T* scratch` parameter — callers must allocate
+//   `threadgroup T scratch[32 * 32]` at kernel scope and pass it in.
+//
+//   This is a real signature divergence from BaseNAXFrag. NAXTile's
+//   wrappers (load_rows, load_safe, store_rows, store_safe, store_slice)
+//   currently follow BaseNAXFrag's convention; Phase 2 / Task 2.2 must
+//   redesign that dispatch before any NAXTile<..., NAXFrag32> instantiation
+//   compiles. See docs/superpowers/specs/2026-04-27-nax-g16-fix-plan.md.
 ///////////////////////////////////////////////////////////////////////////////
 
 struct NAXFrag32 {
@@ -800,11 +819,14 @@ struct NAXFrag32 {
 
   // store_slice is only used by the SDPA path (Phase 5). Leaving it out for
   // now so callers who reach for it on g16s fail at compile time rather than
-  // silently produce wrong output.
+  // silently produce wrong output. Variadic over all arguments so any caller
+  // shape is intercepted by the static_assert (rather than a more confusing
+  // template-deduction error earlier in the chain).
+  // Note: Metal forbids forwarding references (Args&&) without explicit address
+  // space qualifiers, so we use value-parameter variadic (Args...) here.
   template <typename T, typename... Args>
   METAL_FUNC static void store_slice(
       const thread dtype_frag_t<T>&,
-      device T*,
       Args...) {
     static_assert(
         sizeof(T) < 0,
@@ -1011,6 +1033,9 @@ struct NAXTile {
   load_rows(const device U* src, const int ld, const short n_rows) {
     const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
       const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+        // TODO(nax-g16-fix): NAXFrag32's load_safe/load_rows/store_safe/store_rows
+        // require an extra `threadgroup T* scratch` parameter (see NAXFrag32
+        // struct header). Phase 2 / Task 2.2 must redesign this dispatch.
         NAXFrag_t::load_rows(
             frag_at<idx_row.value, idx_col.value>(),
             src,
@@ -1028,6 +1053,9 @@ struct NAXTile {
   load_safe(const device U* src, const int ld, const short2 src_tile_dims) {
     const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
       const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+        // TODO(nax-g16-fix): NAXFrag32's load_safe/load_rows/store_safe/store_rows
+        // require an extra `threadgroup T* scratch` parameter (see NAXFrag32
+        // struct header). Phase 2 / Task 2.2 must redesign this dispatch.
         NAXFrag_t::load_safe(
             frag_at<idx_row.value, idx_col.value>(),
             src,
@@ -1046,6 +1074,9 @@ struct NAXTile {
       const {
     const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
       const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+        // TODO(nax-g16-fix): NAXFrag32's load_safe/load_rows/store_safe/store_rows
+        // require an extra `threadgroup T* scratch` parameter (see NAXFrag32
+        // struct header). Phase 2 / Task 2.2 must redesign this dispatch.
         NAXFrag_t::store_rows(
             frag_at<idx_row.value, idx_col.value>(),
             dst,
@@ -1063,6 +1094,9 @@ struct NAXTile {
   store_safe(device U* dst, const int ld, const short2 dst_tile_dims) const {
     const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
       const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+        // TODO(nax-g16-fix): NAXFrag32's load_safe/load_rows/store_safe/store_rows
+        // require an extra `threadgroup T* scratch` parameter (see NAXFrag32
+        // struct header). Phase 2 / Task 2.2 must redesign this dispatch.
         NAXFrag_t::store_safe(
             frag_at<idx_row.value, idx_col.value>(),
             dst,
@@ -1084,6 +1118,9 @@ struct NAXTile {
       const short2 stop) const {
     const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
       const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+        // TODO(nax-g16-fix): NAXFrag32's load_safe/load_rows/store_safe/store_rows
+        // require an extra `threadgroup T* scratch` parameter (see NAXFrag32
+        // struct header). Phase 5 must redesign this dispatch.
         NAXFrag_t::store_slice(
             frag_at<idx_row.value, idx_col.value>(),
             dst,
