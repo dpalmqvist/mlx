@@ -440,8 +440,84 @@ def test_mma_register_only():
         )
 
 
+def test_mma_via_tg_load_store():
+    """End-to-end mma via NAXFrag32::load (tensor_inline over threadgroup) →
+    mma → NAXFrag32::store. Validates the layout-agnostic I/O path that
+    production kernels will use. With Task 1.6b's register-only test passing,
+    a failure here points to NAXFrag32::load or store, not mma itself.
+    """
+    src = """
+    constexpr int M = 32, N = 32, K = 32;
+    using Frag = NAXFrag32;
+
+    threadgroup float A_tg[32 * 32];
+    threadgroup float B_tg[32 * 32];
+    threadgroup float C_tg[32 * 32];
+
+    const ushort lane = __metal_get_thread_index_in_simdgroup(ushort());
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < 32; ++i) {
+        const short flat = lane * 32 + i;
+        A_tg[flat] = A[flat];
+        B_tg[flat] = B[flat];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    Frag::dtype_frag_t<float> a_frag, b_frag, c_frag;
+    Frag::load(a_frag, (const threadgroup float*)A_tg, (short)32);
+    Frag::load(b_frag, (const threadgroup float*)B_tg, (short)32);
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < 32; ++i) {
+        c_frag[i] = 0.0f;
+    }
+
+    Frag::mma(c_frag,
+              a_frag, metal::bool_constant<false>{},
+              b_frag, metal::bool_constant<false>{});
+
+    Frag::store(c_frag, (threadgroup float*)C_tg, (short)32);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < 32; ++i) {
+        const short flat = lane * 32 + i;
+        C[flat] = C_tg[flat];
+    }
+    """
+    k = mx.fast.metal_kernel(
+        name="probe_naxfrag32_tg_load_store",
+        input_names=["A", "B"],
+        output_names=["C"],
+        source=src,
+        header=HEADER,
+    )
+    A_np = np.random.RandomState(0).randint(-3, 4, (32, 32)).astype(np.float32)
+    B_np = np.random.RandomState(1).randint(-3, 4, (32, 32)).astype(np.float32)
+    A = mx.array(A_np)
+    B = mx.array(B_np)
+    out = k(
+        inputs=[A, B],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(32, 32)],
+        output_dtypes=[mx.float32],
+    )
+    mx.eval(out[0])
+    ref = A_np @ B_np
+    err = float(np.max(np.abs(np.asarray(out[0]) - ref)))
+    if err >= 1e-3:
+        diff = np.abs(np.asarray(out[0]) - ref)
+        bad = np.argwhere(diff >= 1e-3)
+        sample = bad[:5].tolist() if len(bad) > 0 else []
+        raise AssertionError(
+            f"max|err|={err:.4g} (>= 1e-3); {len(bad)} bad cells; "
+            f"first few: {sample}"
+        )
+
+
 def main():
-    tests = [test_compile_smoke, test_mma_register_only]
+    tests = [test_compile_smoke, test_mma_register_only, test_mma_via_tg_load_store]
     failed = 0
     for t in tests:
         try:
