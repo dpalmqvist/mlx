@@ -838,20 +838,34 @@ bool is_nax_available() {
     auto& d = metal::device(mlx::core::Device::gpu);
     auto arch = d.get_architecture().back();
     auto gen = d.get_architecture_gen();
-    // M4 Pro (applegpu_g16s) was previously enabled with gen>=16, but
-    // tools/probe_nax_descriptor.py shows MPP matmul2d on g16s only
-    // produces correct results with descriptor (32,32,32) — every smaller
-    // or asymmetric descriptor (including the (16,32,16) used throughout
-    // the NAX kernels) returns wrong values via the layout-agnostic
-    // tensor_inline + cT.load/store path. Re-enabling NAX on g16 needs a
-    // dedicated 32x32 frag and kernel variant; see
-    // docs/superpowers/specs/2026-04-27-nax-g16-fix-plan.md.
-    can_use_nax &= gen >= (arch == 'p' ? 18 : 17);
+    // Historical note: NAX was originally locked out on gen < 17 because
+    // tools/probe_nax_descriptor.py showed that the (16,32,16) MPP descriptor
+    // used throughout the NAX kernels returns wrong values on g16s (M4 Pro).
+    // Phase 2 (2026-04-28) resolved this by adding a dedicated NAXFrag32 +
+    // steel_gemm_fused_nax_g16 path that uses the (32,32,32) descriptor which
+    // g16s does support correctly. Non-fused NAX sites (matmul.cpp,
+    // quantized.cpp, scaled_dot_product_attention.cpp) continue to guard
+    // themselves with `nax_arch_flavor() != kG16` until those receive their
+    // own _g16 kernels. See
+    // docs/superpowers/specs/2026-04-28-nax-g16-phase2-design.md.
+    can_use_nax &= gen >= 16;
     return can_use_nax;
   };
   static bool is_nax_available_ = _check_nax();
   return is_nax_available_;
 #endif
+}
+
+NAXArchFlavor nax_arch_flavor() {
+  static NAXArchFlavor flavor = []() {
+    if (!is_nax_available()) {
+      return NAXArchFlavor::kNone;
+    }
+    auto& d = metal::device(mlx::core::Device::gpu);
+    auto gen = d.get_architecture_gen();
+    return (gen == 16) ? NAXArchFlavor::kG16 : NAXArchFlavor::kG17Plus;
+  }();
+  return flavor;
 }
 
 } // namespace mlx::core::metal
