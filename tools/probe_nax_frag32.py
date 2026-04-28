@@ -177,8 +177,11 @@ struct NAXFrag32 {
     auto ct = op.template get_left_input_cooperative_tensor<T, T, T>();
 
     metal::dextents<int32_t, 2> ext(32, ld);
-    metal::tensor<threadgroup const U, metal::dextents<int32_t, 2>, metal::tensor_inline>
-        view((threadgroup const U*)src, ext);
+    // MPP cooperative_tensor::load requires the view's element type to match
+    // the cooperative tensor's element type exactly (no const qualifier).
+    // Casting away const internally preserves the const-correct API.
+    metal::tensor<threadgroup U, metal::dextents<int32_t, 2>, metal::tensor_inline>
+        view(const_cast<threadgroup U*>(src), ext);
     ct.load(view);
 
     STEEL_PRAGMA_UNROLL
