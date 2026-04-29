@@ -55,10 +55,17 @@ void gemm_epilogue(
         // load/safe-load, we need fdc == 1 — the cast and pointer arithmetic
         // below assume that. test_blas exercises only fdc==1 for fused gemm.
         if constexpr (kAlignedM && kAlignedN) {
-          CFrag::load(
+          // Use load_safe with full (kFragRows x kFragCols) bounds: this stages
+          // through scratch, avoiding the MPP cooperative-tensor device-load
+          // restriction that requires ld == kFragCols (== 32). load_safe with
+          // row_lim == kFragRows and col_lim == kFragCols zero-fills nothing.
+          CFrag::load_safe(
               celems,
               C + m.value * addmm_params->ldc + n.value * addmm_params->fdc,
-              addmm_params->ldc);
+              addmm_params->ldc,
+              short(CFrag::kFragRows),
+              short(CFrag::kFragCols),
+              (threadgroup T*)scratch);
         } else {
           // Per-frag bounds: negative when frag is past the tile edge; load_safe's
           // `r < row_lim` test correctly zero-fills via signed comparison.
@@ -247,13 +254,14 @@ template <
             params->K,
             params->gemm_k_iterations_aligned,
             sgp_sm,
-            sgp_sn);
+            sgp_sn,
+            (threadgroup T*)sg_scratch);
         if (use_out_source) {
           gemm_epilogue<kAlignedM.value, kAlignedN.value>(
               Dtile, C, params, addmm_params, sgp_sm, sgp_sn, sg_scratch);
         }
         if constexpr (kAlignedM && kAlignedN) {
-          Dtile.store(D, int(params->ldd));
+          Dtile.store(D, int(params->ldd), sg_scratch);
         } else {
           Dtile.store_safe(D, int(params->ldd), short2(sgp_sn, sgp_sm), sg_scratch);
         }

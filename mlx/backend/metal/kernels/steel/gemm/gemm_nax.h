@@ -32,7 +32,8 @@ auto gemm_loop(
     int K,
     int gemm_k_iterations_aligned,
     const short sgp_sm,
-    const short sgp_sn) {
+    const short sgp_sn,
+    threadgroup T* scratch) {
   constexpr short TM = SM / NAXFrag_::kFragRows;
   constexpr short TN = SN / NAXFrag_::kFragCols;
   constexpr short TK = SK / NAXFrag_::kFragRows;
@@ -64,19 +65,19 @@ auto gemm_loop(
       const int B_offset = transpose_b ? k : k * ldb;
 
       if constexpr (kAlignedM) {
-        Atile.load(A + A_offset, lda);
+        Atile.load(A + A_offset, lda, scratch);
       } else {
         const short rmax = transpose_a ? SK : sgp_sm;
         const short cmax = transpose_a ? sgp_sm : SK;
-        Atile.load_safe(A + A_offset, lda, short2(cmax, rmax));
+        Atile.load_safe(A + A_offset, lda, short2(cmax, rmax), scratch);
       }
 
       if constexpr (kAlignedN) {
-        Btile.load(B + B_offset, ldb);
+        Btile.load(B + B_offset, ldb, scratch);
       } else {
         const short rmax = transpose_b ? sgp_sn : SK;
         const short cmax = transpose_b ? SK : sgp_sn;
-        Btile.load_safe(B + B_offset, ldb, short2(cmax, rmax));
+        Btile.load_safe(B + B_offset, ldb, short2(cmax, rmax), scratch);
       }
 
       tile_matmad_nax(
@@ -114,8 +115,8 @@ auto gemm_loop(
       const int A_offset = transpose_a ? k * lda : k;
       const int B_offset = transpose_b ? k : k * ldb;
 
-      Atile.load_safe(A + A_offset, lda, Aklims);
-      Btile.load_safe(B + B_offset, ldb, Bklims);
+      Atile.load_safe(A + A_offset, lda, Aklims, scratch);
+      Btile.load_safe(B + B_offset, ldb, Bklims, scratch);
 
       tile_matmad_nax(
           Dtile,
