@@ -719,10 +719,11 @@ struct NAXFrag32 {
     ct.store(view);
   }
 
-  // Device-memory variant of the contiguous load. Same body as the
-  // threadgroup overload above with the address space swapped — used by
-  // NAXTile's aligned device-pointer load and by gemm_epilogue's aligned
-  // C-load. Validated by tools/probe_nax_frag32.py::test_mma_via_dv_load_store.
+  // Device-memory variant of the contiguous load. Cooperative tensor is
+  // parameterized on U so MPP's tensor_inline view (also U) accepts
+  // ct.load(view). Loaded values are static_cast<T>(ct[i]) into the thread
+  // frag, mirroring the threadgroup overload's pattern. Validated by
+  // tools/probe_nax_frag32.py::test_mma_via_dv_load_store.
   template <typename T, typename U>
   METAL_FUNC static void load(
       thread dtype_frag_t<T>& dst,
@@ -735,7 +736,7 @@ struct NAXFrag32 {
         /*relaxed_precision=*/true,
         mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
     mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
-    auto ct = op.template get_left_input_cooperative_tensor<T, T, T>();
+    auto ct = op.template get_left_input_cooperative_tensor<U, U, U>();
 
     metal::dextents<int32_t, 2> ext(32, ld);
     metal::tensor<device U, metal::dextents<int32_t, 2>, metal::tensor_inline>
@@ -749,7 +750,13 @@ struct NAXFrag32 {
   }
 
   // Device-memory variant of the contiguous store. Same body as the
-  // threadgroup overload with the address space swapped.
+  // threadgroup overload with the address space swapped, plus support for
+  // T != U: the destination cooperative tensor is parameterized on the
+  // device pointer type U so MPP's tensor_inline view (also U) accepts
+  // ct.store(view). Frag elements are cast static_cast<U>(src[i]) before
+  // being written into the cooperative tensor.
+  // Validated by tools/probe_nax_frag32.py::test_mma_via_dv_load_store and
+  // ::test_store_device_mixed_precision.
   template <typename T, typename U>
   METAL_FUNC static void store(
       const thread dtype_frag_t<T>& src,
@@ -763,13 +770,13 @@ struct NAXFrag32 {
         mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
     mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
     auto ct = op.template get_destination_cooperative_tensor<
-        decltype(op.template get_left_input_cooperative_tensor<T, T, T>()),
-        decltype(op.template get_right_input_cooperative_tensor<T, T, T>()),
-        T>();
+        decltype(op.template get_left_input_cooperative_tensor<U, U, U>()),
+        decltype(op.template get_right_input_cooperative_tensor<U, U, U>()),
+        U>();
 
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kElemsPerFrag; i++) {
-      ct[i] = static_cast<T>(src[i]);
+      ct[i] = static_cast<U>(src[i]);
     }
 
     metal::dextents<int32_t, 2> ext(32, ld);
