@@ -238,7 +238,8 @@ template <
             kAlignedM.value,
             kAlignedN.value,
             kAlignedK.value,
-            AccumType>(
+            AccumType,
+            NAXFrag_>(
             A,
             B,
             params->lda,

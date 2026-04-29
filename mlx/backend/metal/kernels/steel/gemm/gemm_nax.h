@@ -22,7 +22,8 @@ template <
     bool kAlignedM,
     bool kAlignedN,
     bool kAlignedK,
-    typename AccumType = float>
+    typename AccumType = float,
+    class NAXFrag_ = BaseNAXFrag>
 auto gemm_loop(
     const device T* A,
     const device T* B,
@@ -32,9 +33,9 @@ auto gemm_loop(
     int gemm_k_iterations_aligned,
     const short sgp_sm,
     const short sgp_sn) {
-  constexpr short TM = SM / 16;
-  constexpr short TN = SN / 16;
-  constexpr short TK = SK / 16;
+  constexpr short TM = SM / NAXFrag_::kFragRows;
+  constexpr short TN = SN / NAXFrag_::kFragCols;
+  constexpr short TK = SK / NAXFrag_::kFragRows;
 
   constexpr int RA = transpose_a ? TK : TM;
   constexpr int CA = transpose_a ? TM : TK;
@@ -42,7 +43,7 @@ auto gemm_loop(
   constexpr int RB = transpose_b ? TN : TK;
   constexpr int CB = transpose_b ? TK : TN;
 
-  NAXTile<AccumType, TM, TN> Dtile;
+  NAXTile<AccumType, TM, TN, NAXFrag_> Dtile;
   Dtile.clear();
 
   int gemm_k_iterations_ = gemm_k_iterations_aligned;
@@ -53,8 +54,8 @@ auto gemm_loop(
 
     STEEL_PRAGMA_NO_UNROLL
     for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-      NAXTile<T, RA, CA> Atile;
-      NAXTile<T, RB, CB> Btile;
+      NAXTile<T, RA, CA, NAXFrag_> Atile;
+      NAXTile<T, RB, CB, NAXFrag_> Btile;
       const int k = kk1;
 
       volatile int compiler_barrier;
@@ -99,8 +100,8 @@ auto gemm_loop(
 
     STEEL_PRAGMA_NO_UNROLL
     for (int kk1 = 0; kk1 < rem_bk; kk1 += SK) {
-      NAXTile<T, RA, CA> Atile;
-      NAXTile<T, RB, CB> Btile;
+      NAXTile<T, RA, CA, NAXFrag_> Atile;
+      NAXTile<T, RB, CB, NAXFrag_> Btile;
 
       const int k = kk1;
       const short psk = max(0, rem_bk - k);
