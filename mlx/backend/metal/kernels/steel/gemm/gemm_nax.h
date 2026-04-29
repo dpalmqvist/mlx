@@ -59,8 +59,6 @@ auto gemm_loop(
       NAXTile<T, RB, CB, NAXFrag_> Btile;
       const int k = kk1;
 
-      volatile int compiler_barrier;
-
       const int A_offset = transpose_a ? k * lda : k;
       const int B_offset = transpose_b ? k : k * ldb;
 
@@ -86,8 +84,6 @@ auto gemm_loop(
           metal::bool_constant<transpose_a>{},
           Btile,
           metal::bool_constant<transpose_b>{});
-
-      (void)compiler_barrier;
     }
 
     A += transpose_a ? (BK * lda) : BK;
