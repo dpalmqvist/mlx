@@ -127,7 +127,8 @@ template <
             partition_k_size,
             partition_k_iters,
             sgp_sm,
-            sgp_sn);
+            sgp_sn,
+            (threadgroup T*)nullptr);
       });
     });
   });
@@ -136,7 +137,7 @@ template <
   dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(align_N || !is_unaligned_sn, [&](auto kAlignedN) {
       if constexpr (kAlignedM && kAlignedN) {
-        Dtile.store(C, int(params->ldc));
+        Dtile.store(C, int(params->ldc), (threadgroup AccumType*)nullptr);
       } else {
         Dtile.store_safe(C, int(params->ldc), short2(sgp_sn, sgp_sm));
       }

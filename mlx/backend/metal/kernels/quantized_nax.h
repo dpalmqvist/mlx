@@ -1035,7 +1035,7 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
           volatile int compiler_barrier;
 
           if constexpr (kAlignedM.value) {
-            Atile.load(x + kk1, K);
+            Atile.load(x + kk1, K, (threadgroup T*)nullptr);
           } else {
             Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
           }
@@ -1060,9 +1060,9 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
       if constexpr (kAlignedM.value && kAlignedN.value) {
-        Dtile.store(y + tm * N + tn, N);
+        Dtile.store(y + tm * N + tn, N, (threadgroup AccumType*)nullptr);
       } else if (kAlignedM.value && sgp_sn == SN) {
-        Dtile.store(y + tm * N + tn, N);
+        Dtile.store(y + tm * N + tn, N, (threadgroup AccumType*)nullptr);
       } else {
         Dtile.store_safe(y + tm * N + tn, N, short2(sgp_sn, sgp_sm));
       }
@@ -1168,7 +1168,7 @@ METAL_FUNC void qmm_n_nax_tgp_impl(
 
       volatile int compiler_barrier;
 
-      Atile.load(x + kk1, K);
+      Atile.load(x + kk1, K, (threadgroup T*)nullptr);
       Btile.template load<T, BN_padded, 1>(Ws + tn + kk1 * ldb_tgp);
 
       tile_matmad_nax(
@@ -1188,7 +1188,7 @@ METAL_FUNC void qmm_n_nax_tgp_impl(
   // Store results to device memory
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  Dtile.store(y + tm * N + tn, N);
+  Dtile.store(y + tm * N + tn, N, (threadgroup AccumType*)nullptr);
 }
 
 template <
@@ -1598,7 +1598,7 @@ template <
             volatile int compiler_barrier;
 
             if constexpr (kAlignedM.value) {
-              Atile.load(xn + kk1, K);
+              Atile.load(xn + kk1, K, (threadgroup T*)nullptr);
             } else {
               Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
             }
@@ -1663,7 +1663,7 @@ template <
         // Store results to device memory
         if constexpr (kAlignedN.value) {
           if (m_lo_lim == 0 && m_hi_lim == SM) {
-            Dtile.store(y + tm * N + tn, N);
+            Dtile.store(y + tm * N + tn, N, (threadgroup AccumType*)nullptr);
           } else {
             Dtile.store_slice(
                 y + tm * N + tn, N, short2(0, m_lo_lim), short2(SN, m_hi_lim));

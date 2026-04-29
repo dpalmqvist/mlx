@@ -110,11 +110,12 @@ gather_mm_rhs_nax(
               params->K,
               params->gemm_k_iterations_aligned,
               sgp_sm,
-              sgp_sn);
+              sgp_sn,
+              (threadgroup T*)nullptr);
 
           if constexpr (kAlignedN.value) {
             if (offset_next - offset == SM) {
-              Ctile.store(C, int(params->ldd));
+              Ctile.store(C, int(params->ldd), (threadgroup AccumType*)nullptr);
             } else {
               Ctile.store_slice(
                   C,

@@ -1114,17 +1114,22 @@ struct NAXTile {
   }
 
   template <typename U>
-  METAL_FUNC void load(const device U* src, const int ld) {
+  METAL_FUNC void load(const device U* src, const int ld,
+                       threadgroup elem_type* scratch) {
     if constexpr (NAXFrag_t::kPacking == 1) {
-      // kPacking==1 path: NAXFrag32 takes a per-frag base pointer + ld.
+      // kPacking==1 path: NAXFrag32's cooperative-tensor device load only
+      // works correctly when ld == kFragCols (==32). For any other stride,
+      // stage through threadgroup scratch (same as load_rows with full rows).
       const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
         const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
           constexpr short m_off = idx_row.value * kFragRows;
           constexpr short n_off = idx_col.value * kFragCols;
-          NAXFrag_t::load(
+          NAXFrag_t::load_rows(
               frag_at<idx_row.value, idx_col.value>(),
               src + m_off * ld + n_off,
-              ld);
+              ld,
+              short(kFragRows),
+              scratch);
         });
       });
     } else {
@@ -1143,17 +1148,22 @@ struct NAXTile {
   }
 
   template <typename U>
-  METAL_FUNC void store(device U* dst, const int ld) const {
+  METAL_FUNC void store(device U* dst, const int ld,
+                        threadgroup elem_type* scratch) const {
     if constexpr (NAXFrag_t::kPacking == 1) {
-      // kPacking==1 path: NAXFrag32 takes a per-frag base pointer + ld.
+      // kPacking==1 path: NAXFrag32's cooperative-tensor device store only
+      // works correctly when ld == kFragCols (==32). For any other stride,
+      // stage through threadgroup scratch (same as store_rows with full rows).
       const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
         const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
           constexpr short m_off = idx_row.value * kFragRows;
           constexpr short n_off = idx_col.value * kFragCols;
-          NAXFrag_t::store(
+          NAXFrag_t::store_rows(
               frag_at<idx_row.value, idx_col.value>(),
               dst + m_off * ld + n_off,
-              ld);
+              ld,
+              short(kFragRows),
+              scratch);
         });
       });
     } else {
