@@ -224,6 +224,9 @@ void steel_matmul_regular_axpby_nax(
         << "_" << type_to_name(out)
         << "_bm" << bm << "_bn" << bn << "_bk" << bk
         << "_wm" << wm << "_wn" << wn; // clang-format on
+  if (metal::nax_arch_flavor() == metal::NAXArchFlavor::kG16) {
+    kname << "_g16";
+  }
 
   std::string base_name = kname.str();
 
