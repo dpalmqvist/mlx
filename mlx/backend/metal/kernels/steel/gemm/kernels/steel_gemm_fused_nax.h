@@ -58,8 +58,10 @@ void gemm_epilogue(
           CFrag::load(
               celems,
               C + m.value * addmm_params->ldc + n.value * addmm_params->fdc,
-              short(addmm_params->ldc));
+              addmm_params->ldc);
         } else {
+          // Per-frag bounds: negative when frag is past the tile edge; load_safe's
+          // `r < row_lim` test correctly zero-fills via signed comparison.
           CFrag::load_safe(
               celems,
               C + m.value * addmm_params->ldc + n.value * addmm_params->fdc,
@@ -213,10 +215,14 @@ template <
   // For BaseNAXFrag (kPacking==2), `1` keeps the array non-zero-sized (Metal
   // rejects zero-sized threadgroup arrays); the BaseNAXFrag path never reads
   // scratch_buf, so the 4-byte cost is negligible.
-  constexpr int kScratchSize = (NAXFrag_::kPacking == 1) ? (WM * WN * 32 * 32) : 1;
+  constexpr int kScratchSize = (NAXFrag_::kPacking == 1)
+      ? (WM * WN * NAXFrag_::kFragRows * NAXFrag_::kFragCols)
+      : 1;
   threadgroup AccumType scratch_buf[kScratchSize];
   threadgroup AccumType* sg_scratch =
-      (NAXFrag_::kPacking == 1) ? (scratch_buf + simd_group_id * 1024) : nullptr;
+      (NAXFrag_::kPacking == 1)
+          ? (scratch_buf + simd_group_id * (NAXFrag_::kFragRows * NAXFrag_::kFragCols))
+          : nullptr;
 
   dispatch_bool(align_K, [&](auto kAlignedK) {
     dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {

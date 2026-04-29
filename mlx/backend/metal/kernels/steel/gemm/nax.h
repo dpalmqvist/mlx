@@ -727,7 +727,7 @@ struct NAXFrag32 {
   METAL_FUNC static void load(
       thread dtype_frag_t<T>& dst,
       const device U* src,
-      const short ld) {
+      const int ld) {
     constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
         32, 32, 32,
         /*transpose_left=*/false,
@@ -754,7 +754,7 @@ struct NAXFrag32 {
   METAL_FUNC static void store(
       const thread dtype_frag_t<T>& src,
       device U* dst,
-      const short ld) {
+      const int ld) {
     constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
         32, 32, 32,
         /*transpose_left=*/false,
@@ -1117,7 +1117,7 @@ struct NAXTile {
           NAXFrag_t::load(
               frag_at<idx_row.value, idx_col.value>(),
               src + m_off * ld + n_off,
-              short(ld));
+              ld);
         });
       });
     } else {
@@ -1146,7 +1146,7 @@ struct NAXTile {
           NAXFrag_t::store(
               frag_at<idx_row.value, idx_col.value>(),
               dst + m_off * ld + n_off,
-              short(ld));
+              ld);
         });
       });
     } else {
