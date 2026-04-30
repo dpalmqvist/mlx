@@ -17,7 +17,8 @@ import mlx.core as mx
 import numpy as np
 
 
-_HF = open("/Users/daniel/.config/superpowers/worktrees/mlx/nax-g16-phase2/tools/probe_nax_frag32.py").read()
+import os as _os
+_HF = open(_os.path.join(_os.path.dirname(__file__), "probe_nax_frag32.py")).read()
 NAX_HEADER = re.search(r'^HEADER = """(.+?)"""', _HF, re.DOTALL | re.MULTILINE).group(1)
 
 
