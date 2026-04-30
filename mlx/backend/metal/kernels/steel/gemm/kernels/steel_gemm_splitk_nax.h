@@ -19,7 +19,8 @@ template <
     int WN,
     bool transpose_a,
     bool transpose_b,
-    typename AccumType = float>
+    typename AccumType = float,
+    class NAXFrag_ = mlx::steel::BaseNAXFrag>
 [[kernel, max_total_threads_per_threadgroup(WM* WN * 32)]] void gemm_splitk_nax(
     const device T* A [[buffer(0)]],
     const device T* B [[buffer(1)]],
@@ -76,8 +77,12 @@ template <
   constexpr short SN = BN / WN;
   constexpr short SK = 32;
 
-  constexpr short TM = SM / 16;
-  constexpr short TN = SN / 16;
+  constexpr short TM = SM / NAXFrag_::kFragRows;
+  constexpr short TN = SN / NAXFrag_::kFragCols;
+  static_assert(SM % NAXFrag_::kFragRows == 0,
+                "SM must be a multiple of NAXFrag_::kFragRows");
+  static_assert(SN % NAXFrag_::kFragCols == 0,
+                "SN must be a multiple of NAXFrag_::kFragCols");
 
   // Calculate simdgroup offsets and alignment
   const short tm = SM * (simd_group_id / WN);
@@ -97,7 +102,22 @@ template <
   B += transpose_b ? (tn * params->ldb) : tn;
   C += tm * params->ldc + tn;
 
-  NAXTile<AccumType, TM, TN> Dtile;
+  NAXTile<AccumType, TM, TN, NAXFrag_> Dtile;
+
+  // Threadgroup scratch for the NAXFrag32 (kPacking==1) path. Mirrors the
+  // fused_nax kernel: each simdgroup gets its own kFragRows*kFragCols slice
+  // used by NAXTile's safe/rows methods to stage device <-> register through
+  // the contiguous-tg cooperative-tensor load. For BaseNAXFrag (kPacking==2),
+  // size 1 keeps the array non-zero (Metal rejects zero-sized tg arrays); the
+  // BaseNAXFrag path never reads scratch_buf.
+  constexpr int kScratchSize = (NAXFrag_::kPacking == 1)
+      ? (WM * WN * NAXFrag_::kFragRows * NAXFrag_::kFragCols)
+      : 1;
+  threadgroup AccumType scratch_buf[kScratchSize];
+  threadgroup AccumType* sg_scratch =
+      (NAXFrag_::kPacking == 1)
+          ? (scratch_buf + simd_group_id * (NAXFrag_::kFragRows * NAXFrag_::kFragCols))
+          : nullptr;
 
   // gemm_loop through the partition
   // Check K-alignment at runtime (partition-specific)
@@ -119,7 +139,8 @@ template <
             kAlignedM.value,
             kAlignedN.value,
             kAlignedK.value,
-            AccumType>(
+            AccumType,
+            NAXFrag_>(
             A,
             B,
             params->lda,
@@ -128,7 +149,7 @@ template <
             partition_k_iters,
             sgp_sm,
             sgp_sn,
-            (threadgroup T*)nullptr);
+            (threadgroup T*)sg_scratch);
       });
     });
   });
@@ -137,9 +158,9 @@ template <
   dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(align_N || !is_unaligned_sn, [&](auto kAlignedN) {
       if constexpr (kAlignedM && kAlignedN) {
-        Dtile.store(C, int(params->ldc), (threadgroup AccumType*)nullptr);
+        Dtile.store(C, int(params->ldc), sg_scratch);
       } else {
-        Dtile.store_safe(C, int(params->ldc), short2(sgp_sn, sgp_sm));
+        Dtile.store_safe(C, int(params->ldc), short2(sgp_sn, sgp_sm), sg_scratch);
       }
     });
   });

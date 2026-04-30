@@ -725,6 +725,10 @@ void steel_gemm_splitk_axpby_nax(
         << "_bm" << bm << "_bn" << bn << "_bk" << bk
         << "_wm" << wm << "_wn" << wn; // clang-format on
 
+  if (metal::nax_arch_flavor() == metal::NAXArchFlavor::kG16) {
+    kname << "_g16";
+  }
+
   std::string base_name = kname.str();
 
   // clang-format off
@@ -2417,7 +2421,13 @@ void GatherMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   // We are walking a in order and b is also in order so we can batch up the
   // matmuls and reuse reading a and b.
   if (M == 1 && right_sorted_ == true) {
+    // Gate gather_mm_rhs_nax off on g16: the kernel uses NAXTile::store_slice
+    // and small-bm shapes (bm=16/32) that aren't yet covered by NAXFrag32
+    // (store_slice for kPacking==1 is deferred to Phase 5 of the NAX g16 fix).
+    // BaseNAXFrag's (16,16,16) descriptor is broken on g16, so fall through
+    // to the non-NAX path.
     if (metal::is_nax_available() &&
+        metal::nax_arch_flavor() != metal::NAXArchFlavor::kG16 &&
         (env::enable_tf32() || a.dtype() != float32)) {
       return gather_mm_rhs_nax(a, b, rhs_indices, out, d, s);
     }
@@ -2537,6 +2547,11 @@ void segmented_mm(
       wm,
       "_wn",
       wn);
+
+  if (use_nax &&
+      metal::nax_arch_flavor() == metal::NAXArchFlavor::kG16) {
+    base_name += "_g16";
+  }
 
   std::string hash_name;
   hash_name.reserve(128);
