@@ -2041,6 +2041,15 @@ void gather_mm_rhs_nax(
     wm = 1;
   }
 
+  // Phase 5: NAXFrag32 (g16) doesn't support bm=16 (kFragRows = 32). Fall
+  // back to the non-NAX gather_mm_rhs path for that case. Pass the original
+  // (non-broadcast) inputs — gather_mm_rhs handles its own broadcasting.
+  if (bm == 16 &&
+      metal::is_nax_available() &&
+      metal::nax_arch_flavor() == metal::NAXArchFlavor::kG16) {
+    return gather_mm_rhs(a_, b_, indices_, out, d, s);
+  }
+
   const bool align_M = (M % bm) == 0;
   const bool align_N = (N % bn) == 0;
   const bool align_K = (K % bk) == 0;
@@ -2066,6 +2075,11 @@ void gather_mm_rhs_nax(
       wm,
       "_wn",
       wn);
+
+  if (metal::is_nax_available() &&
+      metal::nax_arch_flavor() == metal::NAXArchFlavor::kG16) {
+    base_name += "_g16";
+  }
 
   metal::MTLFCList func_consts = {
       {&align_M, MTL::DataType::DataTypeBool, 200},
@@ -2421,13 +2435,7 @@ void GatherMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   // We are walking a in order and b is also in order so we can batch up the
   // matmuls and reuse reading a and b.
   if (M == 1 && right_sorted_ == true) {
-    // Gate gather_mm_rhs_nax off on g16: the kernel uses NAXTile::store_slice
-    // and small-bm shapes (bm=16/32) that aren't yet covered by NAXFrag32
-    // (store_slice for kPacking==1 is deferred to Phase 5 of the NAX g16 fix).
-    // BaseNAXFrag's (16,16,16) descriptor is broken on g16, so fall through
-    // to the non-NAX path.
     if (metal::is_nax_available() &&
-        metal::nax_arch_flavor() != metal::NAXArchFlavor::kG16 &&
         (env::enable_tf32() || a.dtype() != float32)) {
       return gather_mm_rhs_nax(a, b, rhs_indices, out, d, s);
     }
