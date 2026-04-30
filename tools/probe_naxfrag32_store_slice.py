@@ -438,20 +438,50 @@ struct NAXFrag32 {
     }
   }
 
-  // store_slice is only used by the SDPA path (Phase 5). Leaving it out for
-  // now so callers who reach for it on g16s fail at compile time rather than
-  // silently produce wrong output. Variadic over all arguments so any caller
-  // shape is intercepted by the static_assert (rather than a more confusing
-  // template-deduction error earlier in the chain).
-  // Note: Metal forbids forwarding references (Args&&) without explicit address
-  // space qualifiers, so we use value-parameter variadic (Args...) here.
-  template <typename T, typename... Args>
+  // Store a 32x32 frag to device memory, writing only elements inside the
+  // rectangular slice [start_x, stop_x) x [start_y, stop_y). Out-of-bounds
+  // device positions are not touched. Caller must allocate
+  // `threadgroup T scratch[32*32]` and pass it. The signature mirrors
+  // BaseNAXFrag::store_slice so NAXTile can dispatch with a single call site
+  // (gated on kPacking).
+  template <typename T, typename U, typename StrX, typename StrY,
+            typename StartX, typename StopX, typename StartY, typename StopY,
+            typename OffX = Int<0>, typename OffY = Int<0>>
   METAL_FUNC static void store_slice(
-      const thread dtype_frag_t<T>&,
-      Args...) {
-    static_assert(
-        sizeof(T) < 0,
-        "NAXFrag32::store_slice not yet implemented; Phase 5 SDPA needs this");
+      const thread dtype_frag_t<T>& src,
+      device U* dst,
+      StrX str_x,
+      StrY str_y,
+      StartX start_x,
+      StopX stop_x,
+      StartY start_y,
+      StopY stop_y,
+      threadgroup T* scratch,
+      OffX off_x = Int<0>{},
+      OffY off_y = Int<0>{}) {
+    // Stage the 32x32 frag to threadgroup scratch via the contiguous store.
+    store(src, scratch, /*ld=*/short(32));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Per-thread bounded copy: each lane owns kElemsPerFrag (=32) elements.
+    // Address them by flat index: flat = lane * 32 + i, r = flat / 32,
+    // c = flat % 32. The slice bounds are expressed in NAXTile coordinates:
+    // off_x/off_y are the frag's top-left in tile coords (set by NAXTile's
+    // multi-frag dispatch), so a frag-local (r, c) maps to tile-local
+    // (r + off_x, c + off_y).
+    const ushort lane = __metal_get_thread_index_in_simdgroup(ushort());
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemsPerFrag; ++i) {
+      const short flat = lane * kElemsPerFrag + i;
+      const short r = flat / 32;
+      const short c = flat % 32;
+      const short tile_r = r + short(off_x);
+      const short tile_c = c + short(off_y);
+      if (tile_r >= short(start_x) && tile_r < short(stop_x) &&
+          tile_c >= short(start_y) && tile_c < short(stop_y)) {
+        dst[r * str_x + c * str_y] = static_cast<U>(scratch[r * 32 + c]);
+      }
+    }
   }
 };
 
@@ -515,7 +545,11 @@ struct Int {
 };
 """
 
-FULL_HEADER = HEADER.rstrip() + "\n" + _INT_HELPER + "\n"
+# _INT_HELPER must come before the NAXFrag32 struct (which uses Int<0> in
+# store_slice default template args), so we split HEADER at the struct boundary.
+_NAX_STRUCT_MARKER = "///////////////////////////////////////////////////////////////////////////////\n// NAXFrag32"
+_header_pre, _header_post = HEADER.split(_NAX_STRUCT_MARKER, 1)
+FULL_HEADER = _header_pre + _INT_HELPER + "\n" + _NAX_STRUCT_MARKER + _header_post
 
 
 def _make_kernel(name: str, start_x: int, stop_x: int, start_y: int, stop_y: int):
