@@ -233,6 +233,13 @@ MLX_API CommandEncoder& get_command_encoder(Stream s);
 std::unordered_map<int, CommandEncoder>& get_command_encoders();
 NS::SharedPtr<NS::AutoreleasePool> new_scoped_memory_pool();
 
+enum class NAXArchFlavor {
+  kNone,    // NAX not available (pre-gen-16, NAX disabled, or unsupported)
+  kG16,     // M4 Pro family (gen 16) — uses NAXFrag32 + (32,32,32) descriptor
+  kG17Plus, // gen 17+ — uses BaseNAXFrag + (16,32,16) descriptor
+};
+
 bool is_nax_available();
+NAXArchFlavor nax_arch_flavor();
 
 } // namespace mlx::core::metal

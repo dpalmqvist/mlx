@@ -15,7 +15,8 @@ template <
     int WN,
     bool transpose_a,
     bool transpose_b,
-    typename AccumType = float>
+    typename AccumType = float,
+    class NAXFrag_ = mlx::steel::BaseNAXFrag>
 [[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]]
 void segmented_mm_nax(
     const device T* A [[buffer(0)]],
@@ -59,8 +60,12 @@ void segmented_mm_nax(
   constexpr short SN = BN / WN;
   constexpr short SK = 32;
 
-  constexpr short TM = SM / 16;
-  constexpr short TN = SN / 16;
+  constexpr short TM = SM / NAXFrag_::kFragRows;
+  constexpr short TN = SN / NAXFrag_::kFragCols;
+  static_assert(SM % NAXFrag_::kFragRows == 0,
+                "SM must be a multiple of NAXFrag_::kFragRows");
+  static_assert(SN % NAXFrag_::kFragCols == 0,
+                "SN must be a multiple of NAXFrag_::kFragCols");
 
   const short tm = SM * (simd_group_id / WN);
   const short tn = SN * (simd_group_id % WN);
@@ -79,8 +84,20 @@ void segmented_mm_nax(
   B += transpose_b ? (tn * params->ldb) : tn;
   C += tm * params->ldd + tn;
 
-  NAXTile<AccumType, TM, TN> Dtile;
+  NAXTile<AccumType, TM, TN, NAXFrag_> Dtile;
   Dtile.clear();
+
+  // Threadgroup scratch for the NAXFrag32 (kPacking==1) path; mirrors
+  // splitk_nax / fused_nax. BaseNAXFrag (kPacking==2) keeps a 1-element
+  // placeholder since Metal rejects zero-sized tg arrays.
+  constexpr int kScratchSize = (NAXFrag_::kPacking == 1)
+      ? (WM * WN * NAXFrag_::kFragRows * NAXFrag_::kFragCols)
+      : 1;
+  threadgroup AccumType scratch_buf[kScratchSize];
+  threadgroup AccumType* sg_scratch =
+      (NAXFrag_::kPacking == 1)
+          ? (scratch_buf + simd_group_id * (NAXFrag_::kFragRows * NAXFrag_::kFragCols))
+          : nullptr;
 
   const int segment_k_size = k_end - k_start;
   const int segment_k_iters = segment_k_size / BK;
@@ -100,7 +117,8 @@ void segmented_mm_nax(
             kAlignedM.value,
             kAlignedN.value,
             kAlignedK.value,
-            AccumType>(
+            AccumType,
+            NAXFrag_>(
             A,
             B,
             params->lda,
@@ -108,7 +126,8 @@ void segmented_mm_nax(
             segment_k_size,
             segment_k_iters,
             sgp_sm,
-            sgp_sn);
+            sgp_sn,
+            (threadgroup T*)sg_scratch);
       });
     });
   });
@@ -116,9 +135,9 @@ void segmented_mm_nax(
   dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(align_N || !is_unaligned_sn, [&](auto kAlignedN) {
       if constexpr (kAlignedM && kAlignedN) {
-        Dtile.store(C, int(params->ldd));
+        Dtile.store(C, int(params->ldd), sg_scratch);
       } else {
-        Dtile.store_safe(C, int(params->ldd), short2(sgp_sn, sgp_sm));
+        Dtile.store_safe(C, int(params->ldd), short2(sgp_sn, sgp_sm), sg_scratch);
       }
     });
   });

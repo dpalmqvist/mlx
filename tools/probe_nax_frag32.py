@@ -218,6 +218,72 @@ struct NAXFrag32 {
     ct.store(view);
   }
 
+  // Device-memory variant of the contiguous load. Cooperative tensor is
+  // parameterized on U so MPP's tensor_inline view (also U) accepts
+  // ct.load(view). Loaded values are static_cast<T>(ct[i]) into the thread
+  // frag, mirroring the threadgroup overload's pattern. Validated by
+  // tools/probe_nax_frag32.py::test_mma_via_dv_load_store.
+  template <typename T, typename U>
+  METAL_FUNC static void load(
+      thread dtype_frag_t<T>& dst,
+      const device U* src,
+      const int ld) {
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+        32, 32, 32,
+        /*transpose_left=*/false,
+        /*transpose_right=*/false,
+        /*relaxed_precision=*/true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+    auto ct = op.template get_left_input_cooperative_tensor<U, U, U>();
+
+    metal::dextents<int32_t, 2> ext(32, ld);
+    metal::tensor<device U, metal::dextents<int32_t, 2>, metal::tensor_inline>
+        view(const_cast<device U*>(src), ext);
+    ct.load(view);
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemsPerFrag; i++) {
+      dst[i] = static_cast<T>(ct[i]);
+    }
+  }
+
+  // Device-memory variant of the contiguous store. Same body as the
+  // threadgroup overload with the address space swapped, plus support for
+  // T != U: the destination cooperative tensor is parameterized on the
+  // device pointer type U so MPP's tensor_inline view (also U) accepts
+  // ct.store(view). Frag elements are cast static_cast<U>(src[i]) before
+  // being written into the cooperative tensor.
+  // Validated by tools/probe_nax_frag32.py::test_mma_via_dv_load_store and
+  // ::test_store_device_mixed_precision.
+  template <typename T, typename U>
+  METAL_FUNC static void store(
+      const thread dtype_frag_t<T>& src,
+      device U* dst,
+      const int ld) {
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+        32, 32, 32,
+        /*transpose_left=*/false,
+        /*transpose_right=*/false,
+        /*relaxed_precision=*/true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+    auto ct = op.template get_destination_cooperative_tensor<
+        decltype(op.template get_left_input_cooperative_tensor<U, U, U>()),
+        decltype(op.template get_right_input_cooperative_tensor<U, U, U>()),
+        U>();
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemsPerFrag; i++) {
+      ct[i] = static_cast<U>(src[i]);
+    }
+
+    metal::dextents<int32_t, 2> ext(32, ld);
+    metal::tensor<device U, metal::dextents<int32_t, 2>, metal::tensor_inline>
+        view((device U*)dst, ext);
+    ct.store(view);
+  }
+
   // Load a 32x32 frag from device memory, zero-fill out-of-bounds elements.
   // Strategy B: caller provides a threadgroup scratch buffer (32*32 elements).
   // Each lane fills its slice of the staging buffer with bounds-checked copies
@@ -561,6 +627,353 @@ def test_mma_via_tg_load_store():
         )
 
 
+def test_mma_via_dv_load_store():
+    """End-to-end mma via NAXFrag32::load (tensor_inline over device) →
+    mma → NAXFrag32::store (tensor_inline over device). Validates the
+    device-pointer I/O path added in Task 2.0 that NAXTile's aligned
+    load/store and gemm_epilogue's aligned C-load will use.
+    """
+    src = """
+    using Frag = NAXFrag32;
+
+    Frag::dtype_frag_t<float> a_frag, b_frag, c_frag;
+    Frag::load(a_frag, (const device float*)A, (short)32);
+    Frag::load(b_frag, (const device float*)B, (short)32);
+
+    STEEL_PRAGMA_UNROLL
+    for (uint16_t i = 0; i < Frag::kElemsPerFrag; ++i) c_frag[i] = 0.0f;
+
+    Frag::mma(c_frag,
+              a_frag, metal::bool_constant<false>{},
+              b_frag, metal::bool_constant<false>{});
+
+    Frag::store(c_frag, (device float*)C, (short)32);
+    """
+    k = mx.fast.metal_kernel(
+        name="probe_naxfrag32_dv_load_store",
+        input_names=["A", "B"],
+        output_names=["C"],
+        source=src,
+        header=HEADER,
+    )
+    A_np = np.random.RandomState(0).randint(-3, 4, (32, 32)).astype(np.float32)
+    B_np = np.random.RandomState(1).randint(-3, 4, (32, 32)).astype(np.float32)
+    A = mx.array(A_np)
+    B = mx.array(B_np)
+    out = k(
+        inputs=[A, B],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(32, 32)],
+        output_dtypes=[mx.float32],
+    )
+    mx.eval(out[0])
+    ref = A_np @ B_np
+    err = float(np.max(np.abs(np.asarray(out[0]) - ref)))
+    if err >= 1e-3:
+        diff = np.abs(np.asarray(out[0]) - ref)
+        bad = np.argwhere(diff >= 1e-3)
+        sample = bad[:5].tolist() if len(bad) > 0 else []
+        raise AssertionError(
+            f"max|err|={err:.4g} (>= 1e-3); {len(bad)} bad cells; "
+            f"first few: {sample}"
+        )
+
+
+def test_store_device_mixed_precision():
+    """NAXFrag32::store<float, half> via device pointer.
+    Loads A and B as floats, runs mma with float accumulator, stores to
+    half via the device-pointer store<float, half> overload.
+    Compares against numpy: (A @ B).astype(np.float16).
+    Validates the T != U path needed by steel_gemm_fused_nax_g16 which
+    stores a float accumulator (AccumType=float) to a half output buffer.
+    """
+    src = """
+    using Frag = NAXFrag32;
+
+    Frag::dtype_frag_t<float> a_frag, b_frag, c_frag;
+    Frag::load(a_frag, (const device float*)A, (short)32);
+    Frag::load(b_frag, (const device float*)B, (short)32);
+
+    STEEL_PRAGMA_UNROLL
+    for (uint16_t i = 0; i < Frag::kElemsPerFrag; ++i) c_frag[i] = 0.0f;
+
+    Frag::mma(c_frag,
+              a_frag, metal::bool_constant<false>{},
+              b_frag, metal::bool_constant<false>{});
+
+    Frag::store(c_frag, (device half*)C, (short)32);
+    """
+    k = mx.fast.metal_kernel(
+        name="probe_naxfrag32_store_mixed_precision",
+        input_names=["A", "B"],
+        output_names=["C"],
+        source=src,
+        header=HEADER,
+    )
+    A_np = np.random.RandomState(2).randint(-3, 4, (32, 32)).astype(np.float32)
+    B_np = np.random.RandomState(3).randint(-3, 4, (32, 32)).astype(np.float32)
+    A = mx.array(A_np)
+    B = mx.array(B_np)
+    out = k(
+        inputs=[A, B],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(32, 32)],
+        output_dtypes=[mx.float16],
+    )
+    mx.eval(out[0])
+    ref = (A_np @ B_np).astype(np.float16)
+    err = float(np.max(np.abs(np.asarray(out[0]).astype(np.float32) - ref.astype(np.float32))))
+    if err >= 1e-2:
+        diff = np.abs(np.asarray(out[0]).astype(np.float32) - ref.astype(np.float32))
+        bad = np.argwhere(diff >= 1e-2)
+        sample = bad[:5].tolist() if len(bad) > 0 else []
+        raise AssertionError(
+            f"max|err|={err:.4g} (>= 1e-2); {len(bad)} bad cells; "
+            f"first few: {sample}"
+        )
+
+
+def test_load_safe_zero_fill():
+    """Validate NAXFrag32::load_safe: load a 32x32 matrix with bounds
+    (row_lim=20, col_lim=24). Elements outside the bounds should be zero-filled.
+    With B = identity, the result C should equal A masked to the (20, 24)
+    top-left rectangle, with zeros elsewhere.
+    """
+    src = """
+    using Frag = NAXFrag32;
+    threadgroup float scratch[32 * 32];
+    Frag::dtype_frag_t<float> a_frag, b_frag, c_frag;
+    Frag::load_safe(a_frag, (const device float*)A, 32, (short)20, (short)24, scratch);
+    Frag::load(b_frag, (const device float*)B, (short)32);
+    STEEL_PRAGMA_UNROLL
+    for (uint16_t i = 0; i < Frag::kElemsPerFrag; ++i) c_frag[i] = 0.0f;
+    Frag::mma(c_frag,
+              a_frag, metal::bool_constant<false>{},
+              b_frag, metal::bool_constant<false>{});
+    Frag::store(c_frag, (device float*)C, (short)32);
+    """
+    k = mx.fast.metal_kernel(
+        name="probe_naxfrag32_load_safe_zero_fill",
+        input_names=["A", "B"],
+        output_names=["C"],
+        source=src,
+        header=HEADER,
+    )
+    A_np = np.random.RandomState(0).randint(-3, 4, (32, 32)).astype(np.float32)
+    B_np = np.eye(32, dtype=np.float32)
+    A = mx.array(A_np)
+    B = mx.array(B_np)
+    out = k(
+        inputs=[A, B],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(32, 32)],
+        output_dtypes=[mx.float32],
+    )
+    mx.eval(out[0])
+    # Reference: A masked to top-left (20, 24), zeros outside.
+    ref = A_np.copy()
+    ref[20:, :] = 0.0
+    ref[:, 24:] = 0.0
+    err = float(np.max(np.abs(np.asarray(out[0]) - ref)))
+    if err >= 1e-3:
+        diff = np.abs(np.asarray(out[0]) - ref)
+        bad = np.argwhere(diff >= 1e-3)
+        sample = bad[:5].tolist() if len(bad) > 0 else []
+        raise AssertionError(
+            f"max|err|={err:.4g} (>= 1e-3); {len(bad)} bad cells; "
+            f"first few: {sample}"
+        )
+
+
+def test_load_rows_zero_fill():
+    """Validate NAXFrag32::load_rows: load a 32x32 matrix with row_lim=20.
+    Rows 20..31 should be zero-filled; all 32 columns are kept.
+    With B = identity, the result C should equal A with rows 20..31 zeroed.
+    """
+    src = """
+    using Frag = NAXFrag32;
+    threadgroup float scratch[32 * 32];
+    Frag::dtype_frag_t<float> a_frag, b_frag, c_frag;
+    Frag::load_rows(a_frag, (const device float*)A, 32, (short)20, scratch);
+    Frag::load(b_frag, (const device float*)B, (short)32);
+    STEEL_PRAGMA_UNROLL
+    for (uint16_t i = 0; i < Frag::kElemsPerFrag; ++i) c_frag[i] = 0.0f;
+    Frag::mma(c_frag,
+              a_frag, metal::bool_constant<false>{},
+              b_frag, metal::bool_constant<false>{});
+    Frag::store(c_frag, (device float*)C, (short)32);
+    """
+    k = mx.fast.metal_kernel(
+        name="probe_naxfrag32_load_rows_zero_fill",
+        input_names=["A", "B"],
+        output_names=["C"],
+        source=src,
+        header=HEADER,
+    )
+    A_np = np.random.RandomState(0).randint(-3, 4, (32, 32)).astype(np.float32)
+    B_np = np.eye(32, dtype=np.float32)
+    A = mx.array(A_np)
+    B = mx.array(B_np)
+    out = k(
+        inputs=[A, B],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(32, 32)],
+        output_dtypes=[mx.float32],
+    )
+    mx.eval(out[0])
+    # Reference: A with rows 20..31 zeroed.
+    ref = A_np.copy()
+    ref[20:, :] = 0.0
+    err = float(np.max(np.abs(np.asarray(out[0]) - ref)))
+    if err >= 1e-3:
+        diff = np.abs(np.asarray(out[0]) - ref)
+        bad = np.argwhere(diff >= 1e-3)
+        sample = bad[:5].tolist() if len(bad) > 0 else []
+        raise AssertionError(
+            f"max|err|={err:.4g} (>= 1e-3); {len(bad)} bad cells; "
+            f"first few: {sample}"
+        )
+
+
+def test_store_safe_skip_oob():
+    """Validate NAXFrag32::store_safe: store a matmul result with bounds
+    (row_lim=20, col_lim=24). Out-of-bounds elements should retain the
+    pre-filled sentinel value of -1.0. C[:20, :24] should match A[:20, :24]
+    (since B = identity), and C[20:, :] / C[:, 24:] should retain -1.0.
+    """
+    src = """
+    using Frag = NAXFrag32;
+
+    // Copy Cinit into C before the matmul so OOB regions start as -1.0.
+    uint tid = thread_position_in_threadgroup.x;
+    for (uint i = tid; i < 32*32; i += 32) ((device float*)C)[i] = ((const device float*)Cinit)[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float scratch[32 * 32];
+    Frag::dtype_frag_t<float> a_frag, b_frag, c_frag;
+    Frag::load(a_frag, (const device float*)A, (short)32);
+    Frag::load(b_frag, (const device float*)B, (short)32);
+    STEEL_PRAGMA_UNROLL
+    for (uint16_t i = 0; i < Frag::kElemsPerFrag; ++i) c_frag[i] = 0.0f;
+    Frag::mma(c_frag,
+              a_frag, metal::bool_constant<false>{},
+              b_frag, metal::bool_constant<false>{});
+    Frag::store_safe(c_frag, (device float*)C, 32, (short)20, (short)24, scratch);
+    """
+    k = mx.fast.metal_kernel(
+        name="probe_naxfrag32_store_safe_skip_oob",
+        input_names=["A", "B", "Cinit"],
+        output_names=["C"],
+        source=src,
+        header=HEADER,
+    )
+    A_np = np.random.RandomState(0).randint(-3, 4, (32, 32)).astype(np.float32)
+    B_np = np.eye(32, dtype=np.float32)
+    Cinit_np = np.full((32, 32), -1.0, dtype=np.float32)
+    A = mx.array(A_np)
+    B = mx.array(B_np)
+    Cinit = mx.array(Cinit_np)
+    out = k(
+        inputs=[A, B, Cinit],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(32, 32)],
+        output_dtypes=[mx.float32],
+    )
+    mx.eval(out[0])
+    result = np.asarray(out[0])
+
+    # Build reference: A @ B = A (identity B), store only in [:20, :24].
+    # The rest should remain -1.0.
+    ref = Cinit_np.copy()
+    ref[:20, :24] = A_np[:20, :24]  # A @ I = A
+
+    err = float(np.max(np.abs(result - ref)))
+    if err >= 1e-3:
+        diff = np.abs(result - ref)
+        bad = np.argwhere(diff >= 1e-3)
+        sample = bad[:5].tolist() if len(bad) > 0 else []
+        # Extra diagnostics: check if OOB sentinel was overwritten.
+        oob_rows_changed = np.any(result[20:, :] != -1.0)
+        oob_cols_changed = np.any(result[:, 24:] != -1.0)
+        raise AssertionError(
+            f"max|err|={err:.4g} (>= 1e-3); {len(bad)} bad cells; "
+            f"first few: {sample}; "
+            f"OOB rows[20:] overwritten={oob_rows_changed}; "
+            f"OOB cols[24:] overwritten={oob_cols_changed}"
+        )
+
+
+def test_store_rows_skip_oob():
+    """Validate NAXFrag32::store_rows: store a matmul result with row_lim=20.
+    Rows 20..31 should retain the pre-filled sentinel value of -1.0.
+    C[:20, :] should match A[:20, :] (since B = identity).
+    """
+    src = """
+    using Frag = NAXFrag32;
+
+    // Copy Cinit into C before the matmul so OOB regions start as -1.0.
+    uint tid = thread_position_in_threadgroup.x;
+    for (uint i = tid; i < 32*32; i += 32) ((device float*)C)[i] = ((const device float*)Cinit)[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float scratch[32 * 32];
+    Frag::dtype_frag_t<float> a_frag, b_frag, c_frag;
+    Frag::load(a_frag, (const device float*)A, (short)32);
+    Frag::load(b_frag, (const device float*)B, (short)32);
+    STEEL_PRAGMA_UNROLL
+    for (uint16_t i = 0; i < Frag::kElemsPerFrag; ++i) c_frag[i] = 0.0f;
+    Frag::mma(c_frag,
+              a_frag, metal::bool_constant<false>{},
+              b_frag, metal::bool_constant<false>{});
+    Frag::store_rows(c_frag, (device float*)C, 32, (short)20, scratch);
+    """
+    k = mx.fast.metal_kernel(
+        name="probe_naxfrag32_store_rows_skip_oob",
+        input_names=["A", "B", "Cinit"],
+        output_names=["C"],
+        source=src,
+        header=HEADER,
+    )
+    A_np = np.random.RandomState(0).randint(-3, 4, (32, 32)).astype(np.float32)
+    B_np = np.eye(32, dtype=np.float32)
+    Cinit_np = np.full((32, 32), -1.0, dtype=np.float32)
+    A = mx.array(A_np)
+    B = mx.array(B_np)
+    Cinit = mx.array(Cinit_np)
+    out = k(
+        inputs=[A, B, Cinit],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(32, 32)],
+        output_dtypes=[mx.float32],
+    )
+    mx.eval(out[0])
+    result = np.asarray(out[0])
+
+    # Build reference: A @ B = A (identity B), store only rows [:20].
+    # Rows [20:] should remain -1.0.
+    ref = Cinit_np.copy()
+    ref[:20, :] = A_np[:20, :]  # A @ I = A
+
+    err = float(np.max(np.abs(result - ref)))
+    if err >= 1e-3:
+        diff = np.abs(result - ref)
+        bad = np.argwhere(diff >= 1e-3)
+        sample = bad[:5].tolist() if len(bad) > 0 else []
+        # Extra diagnostics: check if OOB sentinel was overwritten.
+        oob_rows_changed = np.any(result[20:, :] != -1.0)
+        raise AssertionError(
+            f"max|err|={err:.4g} (>= 1e-3); {len(bad)} bad cells; "
+            f"first few: {sample}; "
+            f"OOB rows[20:] overwritten={oob_rows_changed}"
+        )
+
+
 def test_row_reduce_sum():
     """Validate NAXFrag32::row_reduce<Sum>: fill a 32x32 frag (in registers
     via explicit dr/dc loads) with v(r,c) = r*100 + c. Each row's sum should
@@ -625,6 +1038,12 @@ def main():
         test_compile_smoke,
         test_mma_register_only,
         test_mma_via_tg_load_store,
+        test_mma_via_dv_load_store,
+        test_store_device_mixed_precision,
+        test_load_safe_zero_fill,
+        test_load_rows_zero_fill,
+        test_store_safe_skip_oob,
+        test_store_rows_skip_oob,
         test_row_reduce_sum,
     ]
     failed = 0
