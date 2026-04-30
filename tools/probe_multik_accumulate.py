@@ -16,8 +16,9 @@ import numpy as np
 
 THREADGROUP_SIZE = 32
 
+import os as _os
 HEADER = open(
-    "/Users/daniel/.config/superpowers/worktrees/mlx/nax-g16-phase2/tools/probe_nax_frag32.py"
+    _os.path.join(_os.path.dirname(__file__), "probe_nax_frag32.py")
 ).read()
 import re
 m = re.search(r'^HEADER = """(.+?)"""', HEADER, re.DOTALL | re.MULTILINE)
