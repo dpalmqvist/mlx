@@ -59,8 +59,16 @@ void gemm_epilogue(
           // through scratch, avoiding the MPP cooperative-tensor device-load
           // restriction that requires ld == kFragCols (== 32). load_safe with
           // row_lim == kFragRows and col_lim == kFragCols zero-fills nothing.
-          // C is the destination/accumulator tensor — use Role::Left + false
-          // (transpose_left=false, transpose_right=false) to match NAXFrag32::store.
+          //
+          // CFrag is the destination accumulator. We use Role::Left, false here
+          // because, empirically on g16, MPP's (false, false) descriptor
+          // produces identical per-thread element layouts for both the
+          // left-input and destination cooperative tensors. This is not
+          // contractually guaranteed by MPP — it's an observation about the
+          // (32, 32, 32) descriptor. If MPP changes behavior, this load will
+          // silently scramble the C-addmm result. Future hardening: add a
+          // Role::Destination variant of NAXFrag32::load that uses
+          // get_destination_cooperative_tensor explicitly.
           CFrag::template load_safe<Role::Left, false>(
               celems,
               C + m.value * addmm_params->ldc + n.value * addmm_params->fdc,

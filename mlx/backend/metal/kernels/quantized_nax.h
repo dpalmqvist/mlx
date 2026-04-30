@@ -1035,9 +1035,9 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
           volatile int compiler_barrier;
 
           if constexpr (kAlignedM.value) {
-            Atile.load(x + kk1, K, (threadgroup T*)nullptr);
+            Atile.template load<Role::Left, false>(x + kk1, K, (threadgroup T*)nullptr);
           } else {
-            Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+            Atile.template load_safe<Role::Left, false>(x + kk1, K, short2(SK, sgp_sm));
           }
 
           Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
@@ -1168,7 +1168,7 @@ METAL_FUNC void qmm_n_nax_tgp_impl(
 
       volatile int compiler_barrier;
 
-      Atile.load(x + kk1, K, (threadgroup T*)nullptr);
+      Atile.template load<Role::Left, false>(x + kk1, K, (threadgroup T*)nullptr);
       Btile.template load<T, BN_padded, 1>(Ws + tn + kk1 * ldb_tgp);
 
       tile_matmad_nax(
@@ -1598,9 +1598,9 @@ template <
             volatile int compiler_barrier;
 
             if constexpr (kAlignedM.value) {
-              Atile.load(xn + kk1, K, (threadgroup T*)nullptr);
+              Atile.template load<Role::Left, false>(xn + kk1, K, (threadgroup T*)nullptr);
             } else {
-              Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+              Atile.template load_safe<Role::Left, false>(xn + kk1, K, short2(SK, sgp_sm));
             }
 
             if constexpr (transpose) {
@@ -1636,7 +1636,7 @@ template <
             volatile int compiler_barrier;
 
             const short psk = min(int(SK), max(0, (BK - kk1)));
-            Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));
+            Atile.template load_safe<Role::Left, false>(xn + kk1, K, short2(psk, sgp_sm));
 
             if constexpr (transpose) {
               Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);

@@ -1169,9 +1169,10 @@ struct NAXTile {
   }
 
   // role and transpose are only meaningful for NAXFrag32 (kPacking==1).
-  // For BaseNAXFrag (kPacking==2) the params are ignored — provide defaults
-  // so existing call sites that don't pass them continue to compile.
-  template <Role role = Role::Left, bool transpose = false, typename U>
+  // For BaseNAXFrag (kPacking==2) the params are ignored. No defaults are
+  // provided — callers must pass explicit values so a future kPacking==1
+  // caller cannot silently pick wrong params and reintroduce the g16 bug.
+  template <Role role, bool transpose, typename U>
   METAL_FUNC void load(const device U* src, const int ld,
                        threadgroup elem_type* scratch) {
     if constexpr (NAXFrag_t::kPacking == 1) {
@@ -1241,8 +1242,9 @@ struct NAXTile {
     }
   }
 
-  // role and transpose defaults: backward-compatible for kPacking==2 callers.
-  template <Role role = Role::Left, bool transpose = false, typename U>
+  // role and transpose must be specified explicitly — no defaults, so a future
+  // kPacking==1 caller cannot silently pick wrong params.
+  template <Role role, bool transpose, typename U>
   METAL_FUNC void
   load_rows(const device U* src, const int ld, const short n_rows,
             threadgroup elem_type* scratch = nullptr) {
@@ -1280,8 +1282,9 @@ struct NAXTile {
     }
   }
 
-  // role and transpose defaults: backward-compatible for kPacking==2 callers.
-  template <Role role = Role::Left, bool transpose = false, typename U>
+  // role and transpose must be specified explicitly — no defaults, so a future
+  // kPacking==1 caller cannot silently pick wrong params.
+  template <Role role, bool transpose, typename U>
   METAL_FUNC void
   load_safe(const device U* src, const int ld, const short2 src_tile_dims,
             threadgroup elem_type* scratch = nullptr) {
