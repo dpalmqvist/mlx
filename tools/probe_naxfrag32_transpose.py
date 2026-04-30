@@ -13,39 +13,30 @@ Three plausible fault layers:
   Layer 3 (desc):  The (32,32,32) descriptor on g16 has unexpected transpose semantics.
 
 Sub-probe 1 — test_mma_all_transposes:
-  Uses the existing NAXFrag32::load (hardcodes false/false). Loads A and B
-  through threadgroup staging, then calls mma<ta, tb>. Compares against numpy.
-  Expected on buggy code: (F,F) passes, transposed cases fail.
+  Uses the fixed NAXFrag32::load<Role::Left, ta> / <Role::Right, tb>. Loads A
+  and B through threadgroup staging, then calls mma<ta, tb>. Compares against
+  numpy. Expected after Task 2a fix: all 4 cases pass (max|err|=0).
 
 Sub-probe 2 — test_mma_with_role_aware_load:
-  Uses a new naxfrag32_load_role_aware<ta, tb, is_right> helper that passes the
-  runtime transpose flags into the load descriptor and dispatches on role
-  (left vs right). If sub-probe 2 passes all 4 cases → Layer 1 confirmed.
-  If sub-probe 2 still fails → Layer 2 or 3.
+  Uses naxfrag32_load_role_aware<ta, tb, is_right> helper (diagnostic helper
+  from Task 1 that proved Layer 1 was the bug). Kept as regression coverage.
+  Expected: all 4 cases pass (unchanged).
 
-NOTE: This probe is DIAGNOSTIC, not RED/GREEN gated. Both sub-probes run
-regardless of results. The script exits 0 always. Results are summarised
-at the top of __main__.
+NOTE: This probe is RED/GREEN gated after Task 2a. Both sub-probes must pass
+all 4 cases. The script exits 1 if any sub-probe has a failure.
 
-Results summary (recorded after running on g16 / M4 Pro, 2026-04-30):
-  Sub-probe 1 — test_mma_all_transposes (existing NAXFrag32::load):
+Results summary (recorded after Task 2a fix, g16 / M4 Pro, 2026-04-30):
+  Sub-probe 1 — test_mma_all_transposes (fixed NAXFrag32::load<Role, transpose>):
     (F,F): OK   max|err|=0.0
-    (F,T): FAIL max|err|=103.0
-    (T,F): FAIL max|err|=102.0
-    (T,T): FAIL max|err|=117.0
+    (F,T): OK   max|err|=0.0
+    (T,F): OK   max|err|=0.0
+    (T,T): OK   max|err|=0.0
 
   Sub-probe 2 — test_mma_with_role_aware_load (role-aware descriptor):
     (F,F): OK   max|err|=0.0
     (F,T): OK   max|err|=0.0
     (T,F): OK   max|err|=0.0
     (T,T): OK   max|err|=0.0
-
-  Layer determination: LAYER 1 CONFIRMED.
-    Sub-probe 2 passes all four cases once the load descriptor passes the
-    correct transpose flags and role (left vs right input). The bug is in
-    NAXFrag32::load, which hardcodes transpose_left=false / transpose_right=false
-    and always uses get_left_input_cooperative_tensor, regardless of which
-    operand is being loaded. Task 2a (fix NAXFrag32::load) is the correct next step.
 
 Pattern: follows probe_naxfrag32_store_slice.py (_INT_HELPER + _NAX_STRUCT_MARKER split).
 IF YOU CHANGE NAXFrag32 IN nax.h, UPDATE THE HEADER COPY BELOW.
@@ -200,24 +191,25 @@ struct NAXFrag32 {
   }
 
   // Load the entire 32x32 frag from a contiguous threadgroup region.
+  // role and transpose must match the descriptor used by the consumer mma —
+  // MPP's cooperative-tensor per-thread layout depends on (role, transpose).
   // Materializes a tensor_inline view over the threadgroup pointer and uses
   // the cooperative-tensor load that the MPP runtime handles. Avoids
   // hard-coding (dr, dc) per-thread offsets — same code path as
   // tools/probe_nax_descriptor.py's tg-staged variant, which empirically
   // verifies max|err| = 0 for the (32, 32, 32) descriptor on g16s.
-  template <typename T, typename U>
+  template <Role role, bool transpose, typename T, typename U>
   METAL_FUNC static void load(
       thread dtype_frag_t<T>& dst,
       const threadgroup U* src,
       const short ld) {
     constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
         32, 32, 32,
-        /*transpose_left=*/false,
-        /*transpose_right=*/false,
+        /*transpose_left=*/  (role == Role::Left)  ? transpose : false,
+        /*transpose_right=*/ (role == Role::Right) ? transpose : false,
         /*relaxed_precision=*/true,
         mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
     mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
-    auto ct = op.template get_left_input_cooperative_tensor<T, T, T>();
 
     metal::dextents<int32_t, 2> ext(32, ld);
     // MPP cooperative_tensor::load requires the view's element type to match
@@ -225,11 +217,19 @@ struct NAXFrag32 {
     // Casting away const internally preserves the const-correct API.
     metal::tensor<threadgroup U, metal::dextents<int32_t, 2>, metal::tensor_inline>
         view(const_cast<threadgroup U*>(src), ext);
-    ct.load(view);
 
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < kElemsPerFrag; i++) {
-      dst[i] = static_cast<T>(ct[i]);
+    // Use if constexpr — Metal may not allow ternary across cooperative_tensor
+    // types, since each branch returns a distinct type.
+    if constexpr (role == Role::Right) {
+      auto ct = op.template get_right_input_cooperative_tensor<T, T, T>();
+      ct.load(view);
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < kElemsPerFrag; i++) dst[i] = static_cast<T>(ct[i]);
+    } else {
+      auto ct = op.template get_left_input_cooperative_tensor<T, T, T>();
+      ct.load(view);
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < kElemsPerFrag; i++) dst[i] = static_cast<T>(ct[i]);
     }
   }
 
@@ -261,33 +261,40 @@ struct NAXFrag32 {
     ct.store(view);
   }
 
-  // Device-memory variant of the contiguous load. Cooperative tensor is
-  // parameterized on U so MPP's tensor_inline view (also U) accepts
-  // ct.load(view). Loaded values are static_cast<T>(ct[i]) into the thread
-  // frag, mirroring the threadgroup overload's pattern. Validated by
+  // Device-memory variant of the contiguous load. role and transpose must
+  // match the consumer mma's descriptor (same reason as the threadgroup
+  // overload). Cooperative tensor is parameterized on U so MPP's
+  // tensor_inline view (also U) accepts ct.load(view). Loaded values are
+  // static_cast<T>(ct[i]) into the thread frag, mirroring the threadgroup
+  // overload's pattern. Validated by
   // tools/probe_nax_frag32.py::test_mma_via_dv_load_store.
-  template <typename T, typename U>
+  template <Role role, bool transpose, typename T, typename U>
   METAL_FUNC static void load(
       thread dtype_frag_t<T>& dst,
       const device U* src,
       const int ld) {
     constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
         32, 32, 32,
-        /*transpose_left=*/false,
-        /*transpose_right=*/false,
+        /*transpose_left=*/  (role == Role::Left)  ? transpose : false,
+        /*transpose_right=*/ (role == Role::Right) ? transpose : false,
         /*relaxed_precision=*/true,
         mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
     mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
-    auto ct = op.template get_left_input_cooperative_tensor<U, U, U>();
 
     metal::dextents<int32_t, 2> ext(32, ld);
     metal::tensor<device U, metal::dextents<int32_t, 2>, metal::tensor_inline>
         view(const_cast<device U*>(src), ext);
-    ct.load(view);
 
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < kElemsPerFrag; i++) {
-      dst[i] = static_cast<T>(ct[i]);
+    if constexpr (role == Role::Right) {
+      auto ct = op.template get_right_input_cooperative_tensor<U, U, U>();
+      ct.load(view);
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < kElemsPerFrag; i++) dst[i] = static_cast<T>(ct[i]);
+    } else {
+      auto ct = op.template get_left_input_cooperative_tensor<U, U, U>();
+      ct.load(view);
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < kElemsPerFrag; i++) dst[i] = static_cast<T>(ct[i]);
     }
   }
 
@@ -331,13 +338,15 @@ struct NAXFrag32 {
   // Strategy B: caller provides a threadgroup scratch buffer (32*32 elements).
   // Each lane fills its slice of the staging buffer with bounds-checked copies
   // from device, then calls the cooperative-tensor load on the staged data.
+  // role and transpose are forwarded to load() so the cooperative-tensor
+  // descriptor matches the consumer mma.
   // Avoids depending on MPP partial-tile support that does not exist on this
   // SDK (only tensor_inline/tensor_handle/tensor_offset exist — no padded or
   // strided bounded-view types); per-thread layout still owned by the
   // cooperative tensor inside load().
   // Note: threadgroup scratch cannot be declared inside a device function in
   // Metal; callers must allocate `threadgroup T scratch[32*32]` and pass it.
-  template <typename T, typename U>
+  template <Role role, bool transpose, typename T, typename U>
   METAL_FUNC static void load_safe(
       thread dtype_frag_t<T>& dst,
       const device U* src,
@@ -355,13 +364,15 @@ struct NAXFrag32 {
           (r < row_lim && c < col_lim) ? static_cast<T>(src[r * ld + c]) : T(0);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    load(dst, scratch, /*ld=*/short(32));
+    load<role, transpose>(dst, scratch, /*ld=*/short(32));
   }
 
   // Load a 32x32 frag from device memory with a row bound only; columns are
   // always treated as full 32. Zero-fills rows at or beyond row_lim.
+  // role and transpose are forwarded to load() so the cooperative-tensor
+  // descriptor matches the consumer mma.
   // Caller must allocate `threadgroup T scratch[32*32]` and pass it.
-  template <typename T, typename U>
+  template <Role role, bool transpose, typename T, typename U>
   METAL_FUNC static void load_rows(
       thread dtype_frag_t<T>& dst,
       const device U* src,
@@ -378,7 +389,7 @@ struct NAXFrag32 {
           (r < row_lim) ? static_cast<T>(src[r * ld + c]) : T(0);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    load(dst, scratch, /*ld=*/short(32));
+    load<role, transpose>(dst, scratch, /*ld=*/short(32));
   }
 
   // Store a 32x32 frag to device memory, skipping elements out-of-bounds.
@@ -535,6 +546,9 @@ struct Int {
   static constant constexpr const short value = N;
   METAL_FUNC constexpr operator short() const { return N; }
 };
+
+// Role of an operand in a matmul2d descriptor (mirrors mlx::steel::Role).
+enum class Role { Left, Right };
 """
 
 # ---------------------------------------------------------------------------
@@ -599,8 +613,8 @@ FULL_HEADER = (
 
 # ---------------------------------------------------------------------------
 # Sub-probe 1: test_mma_all_transposes
-# Uses existing NAXFrag32::load (hardcodes transpose_left=false/transpose_right=false).
-# Expected: (F,F) passes; transposed cases fail on buggy code.
+# Uses fixed NAXFrag32::load<Role::Left, ta> / <Role::Right, tb>.
+# Expected: all 4 cases pass after Task 2a fix.
 # ---------------------------------------------------------------------------
 
 _KERNEL_SRC_EXISTING_LOAD = """
@@ -620,8 +634,8 @@ for (short i = 0; i < 32; ++i) {{
 threadgroup_barrier(mem_flags::mem_threadgroup);
 
 Frag::dtype_frag_t<float> a_frag, b_frag, c_frag;
-Frag::load(a_frag, (const threadgroup float*)A_tg, (short)32);
-Frag::load(b_frag, (const threadgroup float*)B_tg, (short)32);
+Frag::load<Role::Left, {ta}>(a_frag, (const threadgroup float*)A_tg, (short)32);
+Frag::load<Role::Right, {tb}>(b_frag, (const threadgroup float*)B_tg, (short)32);
 
 STEEL_PRAGMA_UNROLL
 for (short i = 0; i < 32; ++i) {{
@@ -746,10 +760,10 @@ def _run_kernel(kernel_src_template: str, ta: bool, tb: bool, name: str) -> np.n
 
 
 def test_mma_all_transposes():
-    """Sub-probe 1: existing NAXFrag32::load (hardcodes false/false in descriptor).
-    Expected on buggy code: (F,F) OK, transposed cases FAIL.
+    """Sub-probe 1: fixed NAXFrag32::load<Role, transpose>.
+    Expected after Task 2a fix: all 4 cases OK, max|err|=0.
     """
-    print("Sub-probe 1: test_mma_all_transposes (existing NAXFrag32::load)")
+    print("Sub-probe 1: test_mma_all_transposes (fixed NAXFrag32::load<Role, transpose>)")
     results = []
     for ta, tb, tag in _TRANSPOSE_CASES:
         name = f"probe_transpose_existing_load_{tag}"
@@ -799,26 +813,19 @@ def test_mma_with_role_aware_load():
 
 
 if __name__ == "__main__":
-    # Results summary (see module docstring for recorded results):
+    # Results summary after Task 2a fix (see module docstring for recorded results):
     #
-    # Sub-probe 1 — existing NAXFrag32::load (transpose flags hardcoded false/false):
-    #   (F,F): OK   max|err|=0.0
-    #   (F,T): FAIL max|err|=103.0
-    #   (T,F): FAIL max|err|=102.0
-    #   (T,T): FAIL max|err|=117.0
-    #
-    # Sub-probe 2 — role-aware load (correct flags + left/right dispatch):
+    # Sub-probe 1 — fixed NAXFrag32::load<Role, transpose>:
     #   (F,F): OK   max|err|=0.0
     #   (F,T): OK   max|err|=0.0
     #   (T,F): OK   max|err|=0.0
     #   (T,T): OK   max|err|=0.0
     #
-    # Layer determination: LAYER 1 CONFIRMED.
-    #   The role-aware load fixes all four transpose cases, proving the bug is in
-    #   NAXFrag32::load's hardcoded (false, false) descriptor and its exclusive use
-    #   of get_left_input_cooperative_tensor regardless of which operand is loaded.
-    #   Next step: Task 2a — fix NAXFrag32::load to accept transpose flags and
-    #   a role (left vs right) parameter, matching the approach validated here.
+    # Sub-probe 2 — role-aware load helper (regression coverage):
+    #   (F,F): OK   max|err|=0.0
+    #   (F,T): OK   max|err|=0.0
+    #   (T,F): OK   max|err|=0.0
+    #   (T,T): OK   max|err|=0.0
     #
     print("=" * 60)
     r1 = test_mma_all_transposes()
@@ -826,22 +833,15 @@ if __name__ == "__main__":
     r2 = test_mma_with_role_aware_load()
     print("=" * 60)
 
-    # Determine layer from results (for automated summary, does not gate exit).
-    sp1_transposed_fail = any(
-        s != "OK" for ta, tb, s, _ in r1 if ta or tb
-    )
-    sp1_ff_ok = all(s == "OK" for ta, tb, s, _ in r1 if not ta and not tb)
+    sp1_all_ok = all(s == "OK" for _, _, s, _ in r1)
     sp2_all_ok = all(s == "OK" for _, _, s, _ in r2)
 
-    if sp1_ff_ok and sp1_transposed_fail and sp2_all_ok:
-        print("Layer determination: LAYER 1 CONFIRMED (load descriptor bug).")
-        print("Next: Task 2a — fix NAXFrag32::load transpose + role dispatch.")
-    elif sp1_ff_ok and sp1_transposed_fail and not sp2_all_ok:
-        print("Layer determination: LAYER 2 or 3 (mma element-routing or descriptor).")
-        print("Role-aware load does not fix the issue; inspect mma or descriptor.")
+    if sp1_all_ok and sp2_all_ok:
+        print("PASS: both sub-probes 8/8 OK.")
+        sys.exit(0)
     else:
-        print("Layer determination: AMBIGUOUS — unexpected result pattern.")
-        print("Manual inspection required.")
-
-    # Always exit 0 — this is a diagnostic probe, not a RED/GREEN gate.
-    sys.exit(0)
+        if not sp1_all_ok:
+            print("FAIL: sub-probe 1 has failures (NAXFrag32::load role/transpose bug).")
+        if not sp2_all_ok:
+            print("FAIL: sub-probe 2 has failures (role-aware helper regression).")
+        sys.exit(1)

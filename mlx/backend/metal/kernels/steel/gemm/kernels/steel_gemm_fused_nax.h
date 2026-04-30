@@ -59,7 +59,9 @@ void gemm_epilogue(
           // through scratch, avoiding the MPP cooperative-tensor device-load
           // restriction that requires ld == kFragCols (== 32). load_safe with
           // row_lim == kFragRows and col_lim == kFragCols zero-fills nothing.
-          CFrag::load_safe(
+          // C is the destination/accumulator tensor — use Role::Left + false
+          // (transpose_left=false, transpose_right=false) to match NAXFrag32::store.
+          CFrag::template load_safe<Role::Left, false>(
               celems,
               C + m.value * addmm_params->ldc + n.value * addmm_params->fdc,
               addmm_params->ldc,
@@ -69,7 +71,7 @@ void gemm_epilogue(
         } else {
           // Per-frag bounds: negative when frag is past the tile edge; load_safe's
           // `r < row_lim` test correctly zero-fills via signed comparison.
-          CFrag::load_safe(
+          CFrag::template load_safe<Role::Left, false>(
               celems,
               C + m.value * addmm_params->ldc + n.value * addmm_params->fdc,
               addmm_params->ldc,

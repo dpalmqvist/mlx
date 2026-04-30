@@ -20,6 +20,11 @@ using namespace metal;
 namespace mlx {
 namespace steel {
 
+// Role of an operand in a matmul2d descriptor.
+// Left  → A input (transpose_left  flag in the descriptor).
+// Right → B input (transpose_right flag in the descriptor).
+enum class Role { Left, Right };
+
 ///////////////////////////////////////////////////////////////////////////////
 // NAX Steel with new tiles
 ///////////////////////////////////////////////////////////////////////////////
@@ -658,24 +663,25 @@ struct NAXFrag32 {
   }
 
   // Load the entire 32x32 frag from a contiguous threadgroup region.
+  // role and transpose must match the descriptor used by the consumer mma —
+  // MPP's cooperative-tensor per-thread layout depends on (role, transpose).
   // Materializes a tensor_inline view over the threadgroup pointer and uses
   // the cooperative-tensor load that the MPP runtime handles. Avoids
   // hard-coding (dr, dc) per-thread offsets — same code path as
   // tools/probe_nax_descriptor.py's tg-staged variant, which empirically
   // verifies max|err| = 0 for the (32, 32, 32) descriptor on g16s.
-  template <typename T, typename U>
+  template <Role role, bool transpose, typename T, typename U>
   METAL_FUNC static void load(
       thread dtype_frag_t<T>& dst,
       const threadgroup U* src,
       const short ld) {
     constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
         32, 32, 32,
-        /*transpose_left=*/false,
-        /*transpose_right=*/false,
+        /*transpose_left=*/  (role == Role::Left)  ? transpose : false,
+        /*transpose_right=*/ (role == Role::Right) ? transpose : false,
         /*relaxed_precision=*/true,
         mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
     mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
-    auto ct = op.template get_left_input_cooperative_tensor<T, T, T>();
 
     metal::dextents<int32_t, 2> ext(32, ld);
     // MPP cooperative_tensor::load requires the view's element type to match
@@ -683,11 +689,19 @@ struct NAXFrag32 {
     // Casting away const internally preserves the const-correct API.
     metal::tensor<threadgroup U, metal::dextents<int32_t, 2>, metal::tensor_inline>
         view(const_cast<threadgroup U*>(src), ext);
-    ct.load(view);
 
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < kElemsPerFrag; i++) {
-      dst[i] = static_cast<T>(ct[i]);
+    // Use if constexpr — Metal may not allow ternary across cooperative_tensor
+    // types, since each branch returns a distinct type.
+    if constexpr (role == Role::Right) {
+      auto ct = op.template get_right_input_cooperative_tensor<T, T, T>();
+      ct.load(view);
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < kElemsPerFrag; i++) dst[i] = static_cast<T>(ct[i]);
+    } else {
+      auto ct = op.template get_left_input_cooperative_tensor<T, T, T>();
+      ct.load(view);
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < kElemsPerFrag; i++) dst[i] = static_cast<T>(ct[i]);
     }
   }
 
@@ -719,33 +733,40 @@ struct NAXFrag32 {
     ct.store(view);
   }
 
-  // Device-memory variant of the contiguous load. Cooperative tensor is
-  // parameterized on U so MPP's tensor_inline view (also U) accepts
-  // ct.load(view). Loaded values are static_cast<T>(ct[i]) into the thread
-  // frag, mirroring the threadgroup overload's pattern. Validated by
+  // Device-memory variant of the contiguous load. role and transpose must
+  // match the consumer mma's descriptor (same reason as the threadgroup
+  // overload). Cooperative tensor is parameterized on U so MPP's
+  // tensor_inline view (also U) accepts ct.load(view). Loaded values are
+  // static_cast<T>(ct[i]) into the thread frag, mirroring the threadgroup
+  // overload's pattern. Validated by
   // tools/probe_nax_frag32.py::test_mma_via_dv_load_store.
-  template <typename T, typename U>
+  template <Role role, bool transpose, typename T, typename U>
   METAL_FUNC static void load(
       thread dtype_frag_t<T>& dst,
       const device U* src,
       const int ld) {
     constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
         32, 32, 32,
-        /*transpose_left=*/false,
-        /*transpose_right=*/false,
+        /*transpose_left=*/  (role == Role::Left)  ? transpose : false,
+        /*transpose_right=*/ (role == Role::Right) ? transpose : false,
         /*relaxed_precision=*/true,
         mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
     mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
-    auto ct = op.template get_left_input_cooperative_tensor<U, U, U>();
 
     metal::dextents<int32_t, 2> ext(32, ld);
     metal::tensor<device U, metal::dextents<int32_t, 2>, metal::tensor_inline>
         view(const_cast<device U*>(src), ext);
-    ct.load(view);
 
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < kElemsPerFrag; i++) {
-      dst[i] = static_cast<T>(ct[i]);
+    if constexpr (role == Role::Right) {
+      auto ct = op.template get_right_input_cooperative_tensor<U, U, U>();
+      ct.load(view);
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < kElemsPerFrag; i++) dst[i] = static_cast<T>(ct[i]);
+    } else {
+      auto ct = op.template get_left_input_cooperative_tensor<U, U, U>();
+      ct.load(view);
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < kElemsPerFrag; i++) dst[i] = static_cast<T>(ct[i]);
     }
   }
 
@@ -789,13 +810,15 @@ struct NAXFrag32 {
   // Strategy B: caller provides a threadgroup scratch buffer (32*32 elements).
   // Each lane fills its slice of the staging buffer with bounds-checked copies
   // from device, then calls the cooperative-tensor load on the staged data.
+  // role and transpose are forwarded to load() so the cooperative-tensor
+  // descriptor matches the consumer mma.
   // Avoids depending on MPP partial-tile support that does not exist on this
   // SDK (only tensor_inline/tensor_handle/tensor_offset exist — no padded or
   // strided bounded-view types); per-thread layout still owned by the
   // cooperative tensor inside load().
   // Note: threadgroup scratch cannot be declared inside a device function in
   // Metal; callers must allocate `threadgroup T scratch[32*32]` and pass it.
-  template <typename T, typename U>
+  template <Role role, bool transpose, typename T, typename U>
   METAL_FUNC static void load_safe(
       thread dtype_frag_t<T>& dst,
       const device U* src,
@@ -813,13 +836,15 @@ struct NAXFrag32 {
           (r < row_lim && c < col_lim) ? static_cast<T>(src[r * ld + c]) : T(0);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    load(dst, scratch, /*ld=*/short(32));
+    load<role, transpose>(dst, scratch, /*ld=*/short(32));
   }
 
   // Load a 32x32 frag from device memory with a row bound only; columns are
   // always treated as full 32. Zero-fills rows at or beyond row_lim.
+  // role and transpose are forwarded to load() so the cooperative-tensor
+  // descriptor matches the consumer mma.
   // Caller must allocate `threadgroup T scratch[32*32]` and pass it.
-  template <typename T, typename U>
+  template <Role role, bool transpose, typename T, typename U>
   METAL_FUNC static void load_rows(
       thread dtype_frag_t<T>& dst,
       const device U* src,
@@ -836,7 +861,7 @@ struct NAXFrag32 {
           (r < row_lim) ? static_cast<T>(src[r * ld + c]) : T(0);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    load(dst, scratch, /*ld=*/short(32));
+    load<role, transpose>(dst, scratch, /*ld=*/short(32));
   }
 
   // Store a 32x32 frag to device memory, skipping elements out-of-bounds.
@@ -1143,7 +1168,10 @@ struct NAXTile {
     });
   }
 
-  template <typename U>
+  // role and transpose are only meaningful for NAXFrag32 (kPacking==1).
+  // For BaseNAXFrag (kPacking==2) the params are ignored — provide defaults
+  // so existing call sites that don't pass them continue to compile.
+  template <Role role = Role::Left, bool transpose = false, typename U>
   METAL_FUNC void load(const device U* src, const int ld,
                        threadgroup elem_type* scratch) {
     if constexpr (NAXFrag_t::kPacking == 1) {
@@ -1154,7 +1182,7 @@ struct NAXTile {
         const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
           constexpr short m_off = idx_row.value * kFragRows;
           constexpr short n_off = idx_col.value * kFragCols;
-          NAXFrag_t::load_rows(
+          NAXFrag_t::template load_rows<role, transpose>(
               frag_at<idx_row.value, idx_col.value>(),
               src + m_off * ld + n_off,
               ld,
@@ -1163,6 +1191,8 @@ struct NAXTile {
         });
       });
     } else {
+      // kPacking==2 (BaseNAXFrag): role/transpose not forwarded — per-element
+      // dr/dc loads are layout-invariant.
       const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
         const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
           NAXFrag_t::load(
@@ -1211,7 +1241,8 @@ struct NAXTile {
     }
   }
 
-  template <typename U>
+  // role and transpose defaults: backward-compatible for kPacking==2 callers.
+  template <Role role = Role::Left, bool transpose = false, typename U>
   METAL_FUNC void
   load_rows(const device U* src, const int ld, const short n_rows,
             threadgroup elem_type* scratch = nullptr) {
@@ -1224,7 +1255,7 @@ struct NAXTile {
           // Per-frag row bound clamped to [0, kFragRows].
           const short rl = max(short(0),
                                min(short(kFragRows), short(n_rows - m_off)));
-          NAXFrag_t::load_rows(
+          NAXFrag_t::template load_rows<role, transpose>(
               frag_at<idx_row.value, idx_col.value>(),
               src + m_off * ld + n_off,
               ld,
@@ -1249,7 +1280,8 @@ struct NAXTile {
     }
   }
 
-  template <typename U>
+  // role and transpose defaults: backward-compatible for kPacking==2 callers.
+  template <Role role = Role::Left, bool transpose = false, typename U>
   METAL_FUNC void
   load_safe(const device U* src, const int ld, const short2 src_tile_dims,
             threadgroup elem_type* scratch = nullptr) {
@@ -1266,7 +1298,7 @@ struct NAXTile {
           const short cl = max(short(0),
                                min(short(kFragCols),
                                    short(src_tile_dims.x - n_off)));
-          NAXFrag_t::load_safe(
+          NAXFrag_t::template load_safe<role, transpose>(
               frag_at<idx_row.value, idx_col.value>(),
               src + m_off * ld + n_off,
               ld,
