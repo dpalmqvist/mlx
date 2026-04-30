@@ -15,7 +15,8 @@ template <
     int WN,
     bool transpose_a,
     bool transpose_b,
-    typename AccumType = float>
+    typename AccumType = float,
+    class NAXFrag_ = mlx::steel::BaseNAXFrag>
 [[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void
 gather_mm_rhs_nax(
     const device T* A [[buffer(0)]],
@@ -28,8 +29,12 @@ gather_mm_rhs_nax(
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
   constexpr short SK = 32;
-  constexpr short TM = SM / 16;
-  constexpr short TN = SN / 16;
+  constexpr short TM = SM / NAXFrag_::kFragRows;
+  constexpr short TN = SN / NAXFrag_::kFragCols;
+  static_assert(SM % NAXFrag_::kFragRows == 0,
+                "SM must be a multiple of NAXFrag_::kFragRows");
+  static_assert(SN % NAXFrag_::kFragCols == 0,
+                "SN must be a multiple of NAXFrag_::kFragCols");
 
   if (params->tiles_n <= static_cast<int>(tid.x) ||
       params->tiles_m <= static_cast<int>(tid.y)) {
@@ -65,6 +70,21 @@ gather_mm_rhs_nax(
   C += tm * params->ldd + tn;
   rhs_indices += tm;
 
+  // Threadgroup scratch for the NAXFrag32 (kPacking==1) path. Mirrors the
+  // splitk_nax kernel: each simdgroup gets its own kFragRows*kFragCols slice
+  // used by NAXTile's safe/rows methods to stage device <-> register through
+  // the contiguous-tg cooperative-tensor load. For BaseNAXFrag (kPacking==2),
+  // size 1 keeps the array non-zero (Metal rejects zero-sized tg arrays); the
+  // BaseNAXFrag path never reads scratch_buf.
+  constexpr int kScratchSize = (NAXFrag_::kPacking == 1)
+      ? (WM * WN * NAXFrag_::kFragRows * NAXFrag_::kFragCols)
+      : 1;
+  threadgroup AccumType scratch_buf[kScratchSize];
+  threadgroup AccumType* sg_scratch =
+      (NAXFrag_::kPacking == 1)
+          ? (scratch_buf + simd_group_id * (NAXFrag_::kFragRows * NAXFrag_::kFragCols))
+          : nullptr;
+
   // Do as many matmuls as necessary
   uint32_t index;
   short offset;
@@ -85,7 +105,7 @@ gather_mm_rhs_nax(
     }
     threadgroup_barrier(mem_flags::mem_none);
 
-    NAXTile<AccumType, TM, TN> Ctile;
+    NAXTile<AccumType, TM, TN, NAXFrag_> Ctile;
 
     dispatch_bool(align_K, [&](auto kAlignedK) {
       dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {
@@ -101,7 +121,8 @@ gather_mm_rhs_nax(
               kAlignedM.value,
               kAlignedN.value,
               kAlignedK.value,
-              AccumType>;
+              AccumType,
+              NAXFrag_>;
           Ctile = do_gemm(
               A,
               B + index * params->batch_stride_b,
@@ -111,24 +132,26 @@ gather_mm_rhs_nax(
               params->gemm_k_iterations_aligned,
               sgp_sm,
               sgp_sn,
-              (threadgroup T*)nullptr);
+              (threadgroup T*)sg_scratch);
 
           if constexpr (kAlignedN.value) {
             if (offset_next - offset == SM) {
-              Ctile.store(C, int(params->ldd), (threadgroup AccumType*)nullptr);
+              Ctile.store(C, int(params->ldd), sg_scratch);
             } else {
               Ctile.store_slice(
                   C,
                   int(params->ldd),
                   short2(0, offset),
-                  short2(SN, offset_next));
+                  short2(SN, offset_next),
+                  sg_scratch);
             }
           } else {
             Ctile.store_slice(
                 C,
                 int(params->ldd),
                 short2(0, offset),
-                short2(sgp_sn, offset_next));
+                short2(sgp_sn, offset_next),
+                sg_scratch);
           }
         });
       });

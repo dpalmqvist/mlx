@@ -1379,23 +1379,34 @@ struct NAXTile {
       device U* dst,
       const int ld,
       const short2 start,
-      const short2 stop) const {
+      const short2 stop,
+      threadgroup elem_type* scratch = nullptr) const {
     const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
       const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
-        // TODO(nax-g16-fix): NAXFrag32's load_safe/load_rows/store_safe/store_rows
-        // require an extra `threadgroup T* scratch` parameter (see NAXFrag32
-        // struct header). Phase 5 must redesign this dispatch.
-        NAXFrag_t::store_slice(
-            frag_at<idx_row.value, idx_col.value>(),
-            dst,
-            ld,
-            Int<1>{},
-            start.y,
-            stop.y,
-            start.x,
-            stop.x,
-            idx_row * Int<kFragRows>{},
-            idx_col * Int<kFragCols>{});
+        if constexpr (NAXFrag_t::kPacking == 1) {
+          // NAXFrag32 (g16) — pass scratch.
+          NAXFrag_t::store_slice(
+              frag_at<idx_row.value, idx_col.value>(),
+              dst,
+              ld,
+              Int<1>{},
+              start.y, stop.y,
+              start.x, stop.x,
+              scratch,
+              idx_row * Int<kFragRows>{},
+              idx_col * Int<kFragCols>{});
+        } else {
+          // BaseNAXFrag — no scratch arg.
+          NAXFrag_t::store_slice(
+              frag_at<idx_row.value, idx_col.value>(),
+              dst,
+              ld,
+              Int<1>{},
+              start.y, stop.y,
+              start.x, stop.x,
+              idx_row * Int<kFragRows>{},
+              idx_col * Int<kFragCols>{});
+        }
       });
     });
   }
