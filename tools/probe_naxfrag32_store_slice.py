@@ -474,7 +474,7 @@ STEEL_PRAGMA_UNROLL
 for (short i = 0; i < 32; ++i) {{
     out_buf[lane * 32 + i] = -9999.0f;
 }}
-threadgroup_barrier(mem_flags::mem_threadgroup);
+threadgroup_barrier(mem_flags::mem_device);
 
 // ----- Step 2: build the frag with value r*32+c -----
 // Element i of this lane's frag owns position
@@ -574,6 +574,8 @@ def _check(
 # Test cases
 # ---------------------------------------------------------------------------
 
+# Convention: (start_x, stop_x) are ROW bounds, (start_y, stop_y) are COL bounds.
+# Yes, x→row, y→col — NAXTile passes start.y/stop.y here. See spec Risk #1.
 CASES = [
     # (name_suffix, start_x, stop_x, start_y, stop_y, description)
     ("full",        0,  32,  0, 32, "Full frag — matches store"),
