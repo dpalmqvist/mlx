@@ -8,6 +8,7 @@
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
+#include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/metal.h"
 #include "mlx/device.h"
 #include "mlx/memory.h"
@@ -95,4 +96,31 @@ void init_metal(nb::module_& m) {
     DEPRECATE("mx.metal.device_info", "mx.device_info");
     return mx::device_info(mx::Device(mx::Device::gpu, 0));
   });
+  metal.def(
+      "is_nax_available",
+      &mx::metal::is_nax_available,
+      R"pbdoc(
+      Whether the MLX runtime will dispatch ops onto the Apple Neural
+      Accelerator (NAX) on this device. Reads the MLX_DISABLE_NAX env var
+      on first call and caches the result for the lifetime of the process.
+      )pbdoc");
+  metal.def(
+      "nax_arch_flavor",
+      []() {
+        auto f = mx::metal::nax_arch_flavor();
+        switch (f) {
+          case mx::metal::NAXArchFlavor::kNone:
+            return "none";
+          case mx::metal::NAXArchFlavor::kG16:
+            return "g16";
+          case mx::metal::NAXArchFlavor::kG17Plus:
+            return "g17plus";
+        }
+        return "unknown";
+      },
+      R"pbdoc(
+      Architecture-flavor key for NAX dispatch on this device. One of:
+      "none" (NAX unavailable / disabled), "g16" (M3/M4 family),
+      "g17plus" (post-g16 Apple GPUs).
+      )pbdoc");
 }
