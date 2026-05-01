@@ -79,7 +79,8 @@ template <
     int WM,
     int WN,
     typename MaskType = float,
-    typename AccumType = float>
+    typename AccumType = float,
+    class NAXFrag_ = mlx::steel::BaseNAXFrag>
 [[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void attention_nax(
     const device T* Q [[buffer(0)]],
     const device T* K [[buffer(1)]],
@@ -125,7 +126,8 @@ template <
       make_uniform(params->scale) * make_uniform(1.44269504089f);
 
   // Prepare MMA tiles
-  constexpr short kU = 16;
+  // kU adapts to whichever frag class is used: 16 for BaseNAXFrag, 32 for NAXFrag32
+  constexpr short kU = NAXFrag_::kFragRows;
 
   constexpr int kNWarps = WM * WN;
   static_assert(
@@ -140,7 +142,7 @@ template <
   constexpr short TK = BK / kU;
 
   static_assert(TQ == 1, "Check TQ");
-  using otile_t = NAXTile<AccumType, TQ, TD>;
+  using otile_t = NAXTile<AccumType, TQ, TD, NAXFrag_>;
   otile_t Otile;
 
   Otile.clear();
@@ -152,6 +154,21 @@ template <
   const short2 simd_coord = otile_t::NAXFrag_t::get_coord();
   const short sm = simd_coord.y;
   const short sn = simd_coord.x;
+
+  // Threadgroup scratch for the NAXFrag32 (kPacking==1) path. Each simdgroup
+  // gets its own kFragRows*kFragCols region used by NAXTile's safe/rows methods
+  // to stage device <-> register through the contiguous-tg cooperative-tensor
+  // load. For BaseNAXFrag (kPacking==2), `1` keeps the array non-zero-sized
+  // (Metal rejects zero-sized threadgroup arrays); the BaseNAXFrag path never
+  // reads scratch_buf, so the 4-byte cost is negligible.
+  constexpr int kScratchSize = (NAXFrag_::kPacking == 1)
+      ? (WM * WN * NAXFrag_::kFragRows * NAXFrag_::kFragCols)
+      : 1;
+  threadgroup AccumType scratch_buf[kScratchSize];
+  threadgroup AccumType* sg_scratch =
+      (NAXFrag_::kPacking == 1)
+          ? (scratch_buf + simd_group_id * (NAXFrag_::kFragRows * NAXFrag_::kFragCols))
+          : nullptr;
 
   // Init row reduction variables
   constexpr short kRowsPT = otile_t::kRowsPerThread;
@@ -198,49 +215,103 @@ template <
     const int is_last_k = (kb == (params->NK_aligned));
 
     // Do S = Q @ K.T
-    using stile_t = NAXTile<AccumType, TQ, TK>;
+    using stile_t = NAXTile<AccumType, TQ, TK, NAXFrag_>;
     stile_t Stile;
 
     Stile.clear();
 
-    STEEL_PRAGMA_UNROLL
-    for (short iq = 0; iq < TQ; iq++) {
+    if constexpr (NAXFrag_::kPacking == 2) {
+      // BaseNAXFrag path: (16,32,16) descriptor produces 2 B frags per mma.
+      // Iterate ik in steps of 2 to match the fused-pair mma overload.
       STEEL_PRAGMA_UNROLL
-      for (short ik = 0; ik < TK; ik += 2) {
+      for (short iq = 0; iq < TQ; iq++) {
         STEEL_PRAGMA_UNROLL
-        for (short id = 0; id < TD; id++) {
-          NAXTile<T, 1, 1> Qtile;
-          NAXTile<T, 2, 1> Ktile;
+        for (short ik = 0; ik < TK; ik += 2) {
+          STEEL_PRAGMA_UNROLL
+          for (short id = 0; id < TD; id++) {
+            NAXTile<T, 1, 1> Qtile;
+            NAXTile<T, 2, 1> Ktile;
 
-          const int Q_load_off = iq * kU * int(params->Q_strides[2]) + id * kU;
-          const int K_load_off = ik * kU * int(params->K_strides[2]) + id * kU;
+            const int Q_load_off = iq * kU * int(params->Q_strides[2]) + id * kU;
+            const int K_load_off = ik * kU * int(params->K_strides[2]) + id * kU;
 
-          if (!align_Q && is_last_q) {
-            Qtile.load_rows(
-                Q + Q_load_off,
-                int(params->Q_strides[2]),
-                lim_rows_q - iq * kU);
-          } else {
-            Qtile.load(Q + Q_load_off, int(params->Q_strides[2]));
+            if (!align_Q && is_last_q) {
+              Qtile.load_rows(
+                  Q + Q_load_off,
+                  int(params->Q_strides[2]),
+                  lim_rows_q - iq * kU);
+            } else {
+              Qtile.load(Q + Q_load_off, int(params->Q_strides[2]));
+            }
+
+            if (!align_K && is_last_k) {
+              Ktile.load_rows(
+                  K + K_load_off,
+                  int(params->K_strides[2]),
+                  lim_rows_k - ik * kU);
+            } else {
+              Ktile.load(K + K_load_off, int(params->K_strides[2]));
+            }
+
+            stile_t::NAXFrag_t::mma(
+                Stile.frag_at(iq, ik),
+                Stile.frag_at(iq, ik + 1),
+                Qtile.frag_at(0, 0),
+                metal::false_type{},
+                Ktile.frag_at(0, 0),
+                Ktile.frag_at(1, 0),
+                metal::true_type{});
           }
+        }
+      }
+    } else {
+      // NAXFrag32 path: (32,32,32) descriptor produces 1 frag per mma.
+      // Iterate ik in steps of 1; Ktile is 1x1, K loads kFragRows rows at a time.
+      STEEL_PRAGMA_UNROLL
+      for (short iq = 0; iq < TQ; iq++) {
+        STEEL_PRAGMA_UNROLL
+        for (short ik = 0; ik < TK; ik++) {
+          STEEL_PRAGMA_UNROLL
+          for (short id = 0; id < TD; id++) {
+            NAXTile<T, 1, 1, NAXFrag_> Qtile;
+            NAXTile<T, 1, 1, NAXFrag_> Ktile;
 
-          if (!align_K && is_last_k) {
-            Ktile.load_rows(
-                K + K_load_off,
-                int(params->K_strides[2]),
-                lim_rows_k - ik * kU);
-          } else {
-            Ktile.load(K + K_load_off, int(params->K_strides[2]));
+            const int Q_load_off = iq * kU * int(params->Q_strides[2]) + id * kU;
+            const int K_load_off = ik * kU * int(params->K_strides[2]) + id * kU;
+
+            if (!align_Q && is_last_q) {
+              Qtile.template load_rows<Role::Left, false>(
+                  Q + Q_load_off,
+                  int(params->Q_strides[2]),
+                  lim_rows_q - iq * kU,
+                  (threadgroup T*)sg_scratch);
+            } else {
+              Qtile.template load<Role::Left, false>(
+                  Q + Q_load_off,
+                  int(params->Q_strides[2]),
+                  (threadgroup T*)sg_scratch);
+            }
+
+            if (!align_K && is_last_k) {
+              Ktile.template load_rows<Role::Right, true>(
+                  K + K_load_off,
+                  int(params->K_strides[2]),
+                  lim_rows_k - ik * kU,
+                  (threadgroup T*)sg_scratch);
+            } else {
+              Ktile.template load<Role::Right, true>(
+                  K + K_load_off,
+                  int(params->K_strides[2]),
+                  (threadgroup T*)sg_scratch);
+            }
+
+            stile_t::NAXFrag_t::mma(
+                Stile.frag_at(iq, ik),
+                Qtile.frag_at(0, 0),
+                metal::false_type{},
+                Ktile.frag_at(0, 0),
+                metal::true_type{});
           }
-
-          stile_t::NAXFrag_t::mma(
-              Stile.frag_at(iq, ik),
-              Stile.frag_at(iq, ik + 1),
-              Qtile.frag_at(0, 0),
-              metal::false_type{},
-              Ktile.frag_at(0, 0),
-              Ktile.frag_at(1, 0),
-              metal::true_type{});
         }
       }
     }
@@ -312,7 +383,7 @@ template <
 
       constexpr bool is_bool = is_same_v<MaskType, bool>;
       using melem_t = typename metal::conditional_t<is_bool, bool, AccumType>;
-      using mtile_t = NAXTile<melem_t, TQ, TK>;
+      using mtile_t = NAXTile<melem_t, TQ, TK, NAXFrag_>;
       using mfrag_t = typename mtile_t::frag_type;
 
       if (base_row + BQ <= params->qL && base_col + BK <= params->kL) {
@@ -323,13 +394,22 @@ template <
             const int col_pos = base_col + ik * kU;
 
             mfrag_t mfrag;
-            mtile_t::NAXFrag_t::load(
-                mfrag,
-                mask,
-                int64_t(mask_params->M_strides[2]),
-                Int<1>{},
-                row_pos,
-                col_pos);
+            if constexpr (NAXFrag_::kPacking == 2) {
+              mtile_t::NAXFrag_t::load(
+                  mfrag,
+                  mask,
+                  int64_t(mask_params->M_strides[2]),
+                  Int<1>{},
+                  row_pos,
+                  col_pos);
+            } else {
+              // NAXFrag32: role=Left (mask adds into the score tile S).
+              // Pointer is pre-offset to (row_pos, col_pos).
+              mtile_t::NAXFrag_t::template load<Role::Left, false>(
+                  mfrag,
+                  mask + row_pos * int64_t(mask_params->M_strides[2]) + col_pos,
+                  int(mask_params->M_strides[2]));
+            }
 
             thread auto& fg = Stile.frag_at(iq, ik);
 
@@ -352,15 +432,29 @@ template <
             const int col_pos = base_col + ik * kU;
 
             mfrag_t mfrag;
-            mtile_t::NAXFrag_t::load_safe(
-                mfrag,
-                mask,
-                int64_t(mask_params->M_strides[2]),
-                Int<1>{},
-                params->qL,
-                params->kL,
-                row_pos,
-                col_pos);
+            if constexpr (NAXFrag_::kPacking == 2) {
+              mtile_t::NAXFrag_t::load_safe(
+                  mfrag,
+                  mask,
+                  int64_t(mask_params->M_strides[2]),
+                  Int<1>{},
+                  params->qL,
+                  params->kL,
+                  row_pos,
+                  col_pos);
+            } else {
+              // NAXFrag32: role=Left (mask adds into the score tile S).
+              // Per-frag bounds relative to the frag's top-left corner.
+              const short row_lim = max(short(0), short(params->qL - row_pos));
+              const short col_lim = max(short(0), short(params->kL - col_pos));
+              mtile_t::NAXFrag_t::template load_safe<Role::Left, false>(
+                  mfrag,
+                  mask + row_pos * int64_t(mask_params->M_strides[2]) + col_pos,
+                  int(mask_params->M_strides[2]),
+                  row_lim,
+                  col_lim,
+                  (threadgroup melem_t*)sg_scratch);
+            }
 
             thread auto& fg = Stile.frag_at(iq, ik);
 
@@ -414,39 +508,84 @@ template <
     simdgroup_barrier(mem_flags::mem_none);
 
     // Do O = P @ V
-    STEEL_PRAGMA_UNROLL
-    for (short iq = 0; iq < TQ; iq++) {
+    if constexpr (NAXFrag_::kPacking == 2) {
+      // BaseNAXFrag path: (16,32,16) descriptor produces 2 B frags per mma.
+      // Iterate id in steps of 2 to match the fused-pair mma overload.
       STEEL_PRAGMA_UNROLL
-      for (short id = 0; id < TD; id += 2) {
-        if constexpr (BD == 128) {
-          if (id == 4) {
-            threadgroup_barrier(mem_flags::mem_none);
+      for (short iq = 0; iq < TQ; iq++) {
+        STEEL_PRAGMA_UNROLL
+        for (short id = 0; id < TD; id += 2) {
+          if constexpr (BD == 128) {
+            if (id == 4) {
+              threadgroup_barrier(mem_flags::mem_none);
+            }
+          }
+
+          STEEL_PRAGMA_UNROLL
+          for (short ik = 0; ik < TK; ik++) {
+            NAXTile<T, 1, 2> Vtile;
+
+            const int V_load_off = ik * kU * int(params->V_strides[2]) + id * kU;
+
+            if (!align_K && is_last_k) {
+              Vtile.load_rows(
+                  V + V_load_off,
+                  int(params->V_strides[2]),
+                  lim_rows_k - ik * kU);
+            } else {
+              Vtile.load(V + V_load_off, int(params->V_strides[2]));
+            }
+
+            otile_t::NAXFrag_t::mma(
+                Otile.frag_at(iq, id),
+                Otile.frag_at(iq, id + 1),
+                Stile.frag_at(iq, ik),
+                metal::false_type{},
+                Vtile.frag_at(0, 0),
+                Vtile.frag_at(0, 1),
+                metal::false_type{});
           }
         }
-
+      }
+    } else {
+      // NAXFrag32 path: (32,32,32) descriptor produces 1 frag per mma.
+      // Iterate id in steps of 1; Vtile is 1x1, V loads kFragRows rows at a time.
+      STEEL_PRAGMA_UNROLL
+      for (short iq = 0; iq < TQ; iq++) {
         STEEL_PRAGMA_UNROLL
-        for (short ik = 0; ik < TK; ik++) {
-          NAXTile<T, 1, 2> Vtile;
-
-          const int V_load_off = ik * kU * int(params->V_strides[2]) + id * kU;
-
-          if (!align_K && is_last_k) {
-            Vtile.load_rows(
-                V + V_load_off,
-                int(params->V_strides[2]),
-                lim_rows_k - ik * kU);
-          } else {
-            Vtile.load(V + V_load_off, int(params->V_strides[2]));
+        for (short id = 0; id < TD; id++) {
+          if constexpr (BD == 128) {
+            if (id == 2) {
+              threadgroup_barrier(mem_flags::mem_none);
+            }
           }
 
-          otile_t::NAXFrag_t::mma(
-              Otile.frag_at(iq, id),
-              Otile.frag_at(iq, id + 1),
-              Stile.frag_at(iq, ik),
-              metal::false_type{},
-              Vtile.frag_at(0, 0),
-              Vtile.frag_at(0, 1),
-              metal::false_type{});
+          STEEL_PRAGMA_UNROLL
+          for (short ik = 0; ik < TK; ik++) {
+            NAXTile<T, 1, 1, NAXFrag_> Vtile;
+
+            const int V_load_off = ik * kU * int(params->V_strides[2]) + id * kU;
+
+            if (!align_K && is_last_k) {
+              Vtile.template load_rows<Role::Right, false>(
+                  V + V_load_off,
+                  int(params->V_strides[2]),
+                  lim_rows_k - ik * kU,
+                  (threadgroup T*)sg_scratch);
+            } else {
+              Vtile.template load<Role::Right, false>(
+                  V + V_load_off,
+                  int(params->V_strides[2]),
+                  (threadgroup T*)sg_scratch);
+            }
+
+            otile_t::NAXFrag_t::mma(
+                Otile.frag_at(iq, id),
+                Stile.frag_at(iq, ik),
+                metal::false_type{},
+                Vtile.frag_at(0, 0),
+                metal::false_type{});
+          }
         }
       }
     }
@@ -475,8 +614,8 @@ template <
     if (lim_rows_q <= 0)
       return;
 
-    Otile.store_rows(O, int(params->O_strides[2]), lim_rows_q);
+    Otile.store_rows(O, int(params->O_strides[2]), lim_rows_q, sg_scratch);
   } else {
-    Otile.store(O, int(params->O_strides[2]));
+    Otile.store(O, int(params->O_strides[2]), sg_scratch);
   }
 }
