@@ -1,0 +1,184 @@
+{
+  "headers": {
+    "on": {
+      "_header": true,
+      "arm": "on",
+      "nax_available": true,
+      "nax_flavor": "g16"
+    },
+    "off": {
+      "_header": true,
+      "arm": "off",
+      "nax_available": false,
+      "nax_flavor": "none"
+    }
+  },
+  "rows": [
+    {
+      "kernel_label": "gemm_fused",
+      "shape": {
+        "M": 2048,
+        "N": 4096,
+        "K": 4096
+      },
+      "nax_on_ms": 13.371437500609318,
+      "nax_off_ms": 9.30066699947929,
+      "speedup": 0.6955622384695341,
+      "nax_on_tflops": 5.13927367441747
+    },
+    {
+      "kernel_label": "gemm_fused",
+      "shape": {
+        "M": 2048,
+        "N": 11008,
+        "K": 4096
+      },
+      "nax_on_ms": 37.56908350260346,
+      "nax_off_ms": 25.007229000038933,
+      "speedup": 0.6656331927369478,
+      "nax_on_tflops": 4.915839741344816
+    },
+    {
+      "kernel_label": "gemm_fused",
+      "shape": {
+        "M": 512,
+        "N": 4096,
+        "K": 4096
+      },
+      "nax_on_ms": 3.4802704976755194,
+      "nax_off_ms": 2.4653125037730206,
+      "speedup": 0.7083680723724229,
+      "nax_on_tflops": 4.936360318967871
+    },
+    {
+      "kernel_label": "gemm_splitk",
+      "shape": {
+        "M": 64,
+        "N": 64,
+        "K": 8192
+      },
+      "nax_on_ms": 0.33395799982827157,
+      "nax_off_ms": 0.11952099885093048,
+      "speedup": 0.3578923065546888,
+      "nax_on_tflops": 0.20095001178144806
+    },
+    {
+      "kernel_label": "gemm_splitk",
+      "shape": {
+        "M": 128,
+        "N": 128,
+        "K": 4096
+      },
+      "nax_on_ms": 0.22006250219419599,
+      "nax_off_ms": 0.12454150055418722,
+      "speedup": 0.5659369466056717,
+      "nax_on_tflops": 0.609907306614002
+    },
+    {
+      "kernel_label": "gemm_segmented",
+      "shape": {
+        "B": 8,
+        "M": 512,
+        "N": 4096,
+        "K": 4096
+      },
+      "nax_on_ms": 26.789020499563776,
+      "nax_off_ms": 18.38770899848896,
+      "speedup": 0.686389746828869,
+      "nax_on_tflops": 5.130421004912741
+    },
+    {
+      "kernel_label": "gemm_segmented",
+      "shape": {
+        "B": 32,
+        "M": 128,
+        "N": 128,
+        "K": 128
+      },
+      "nax_on_ms": 0.18020850257016718,
+      "nax_off_ms": 0.14387499686563388,
+      "speedup": 0.7983807357236862,
+      "nax_on_tflops": 0.7447913172006969
+    },
+    {
+      "kernel_label": "gather",
+      "shape": {
+        "tokens": 2048,
+        "E": 8,
+        "hidden": 4096,
+        "expert_hidden": 14336,
+        "top_k": 2
+      },
+      "nax_on_ms": 1757.9020204975677,
+      "nax_off_ms": 1757.2622084990144,
+      "speedup": 0.9996360365986882,
+      "nax_on_tflops": 0.27364229151738756
+    },
+    {
+      "kernel_label": "gather",
+      "shape": {
+        "tokens": 512,
+        "E": 8,
+        "hidden": 4096,
+        "expert_hidden": 4096,
+        "top_k": 2
+      },
+      "nax_on_ms": 121.03379199834308,
+      "nax_off_ms": 121.4297915030329,
+      "speedup": 1.0032718094521507,
+      "nax_on_tflops": 0.28388549842733485
+    },
+    {
+      "kernel_label": "sdpa_prefill",
+      "shape": {
+        "B": 1,
+        "H": 32,
+        "kL": 2048,
+        "hd": 128
+      },
+      "nax_on_ms": 23.68993750133086,
+      "nax_off_ms": 10.576291500910884,
+      "speedup": 0.44644657675085575,
+      "nax_on_tflops": 2.9007875910242253
+    },
+    {
+      "kernel_label": "sdpa_prefill",
+      "shape": {
+        "B": 1,
+        "H": 32,
+        "kL": 8192,
+        "hd": 128
+      },
+      "nax_on_ms": 381.5098750019388,
+      "nax_off_ms": 177.41379150538705,
+      "speedup": 0.4650306666491541,
+      "nax_on_tflops": 2.882000440409078
+    },
+    {
+      "kernel_label": "sdpa_prefill",
+      "shape": {
+        "B": 1,
+        "H": 32,
+        "kL": 512,
+        "hd": 128
+      },
+      "nax_on_ms": 1.700958498986438,
+      "nax_off_ms": 0.8769164996920153,
+      "speedup": 0.5155425603943599,
+      "nax_on_tflops": 2.52502768207412
+    },
+    {
+      "kernel_label": "sdpa_prefill",
+      "shape": {
+        "B": 1,
+        "H": 32,
+        "kL": 2048,
+        "hd": 64
+      },
+      "nax_on_ms": 6.765021000319393,
+      "nax_off_ms": 5.648854497849243,
+      "speedup": 0.8350091592594534,
+      "nax_on_tflops": 5.079029077127446
+    }
+  ]
+}

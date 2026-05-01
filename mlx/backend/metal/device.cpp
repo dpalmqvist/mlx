@@ -830,6 +830,11 @@ bool is_nax_available() {
   return false;
 #else
   auto _check_nax = []() {
+    if (const char* env = std::getenv("MLX_DISABLE_NAX")) {
+      if (env[0] != '\0' && env[0] != '0') {
+        return false;
+      }
+    }
     bool can_use_nax = false;
     if (__builtin_available(
             macOS 26.2, iOS 26.2, tvOS 26.2, visionOS 26.2, *)) {

@@ -239,7 +239,7 @@ enum class NAXArchFlavor {
   kG17Plus, // gen 17+ — uses BaseNAXFrag + (16,32,16) descriptor
 };
 
-bool is_nax_available();
-NAXArchFlavor nax_arch_flavor();
+MLX_API bool is_nax_available();
+MLX_API NAXArchFlavor nax_arch_flavor();
 
 } // namespace mlx::core::metal
