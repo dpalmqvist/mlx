@@ -95,18 +95,84 @@ def _gemm_segmented(B: int, M: int, N: int, K: int) -> Case:
                 {"B": B, "M": M, "N": N, "K": K}, build, flops)
 
 
+def _gather(tokens: int, E: int, hidden: int, expert_hidden: int,
+            top_k: int) -> Case:
+    """MoE-style gather_mm. tokens > 32 keeps us on the bm>=32 NAX path on g16
+    (bm=16 falls back to non-NAX). One expert-projection layer routed via
+    rhs_indices over E experts:
+        x:   (tokens*top_k, 1, hidden)        # per-token (1 x hidden) operands
+        w:   (E, hidden, expert_hidden)
+        out: (tokens*top_k, 1, expert_hidden)
+    """
+    def build():
+        x = mx.random.normal((tokens, hidden)).astype(mx.float16)
+        # Weight matrix per expert: (E, hidden, expert_hidden)
+        w = mx.random.normal((E, hidden, expert_hidden)).astype(mx.float16)
+        # Each token routes to top_k experts. For simplicity in benching
+        # we just generate random rhs_indices over [0, E) of length
+        # tokens * top_k and reshape x accordingly.
+        rhs_idx = mx.random.randint(low=0, high=E,
+                                    shape=(tokens * top_k,)).astype(mx.uint32)
+        # Reshape x to (tokens*top_k, 1, hidden) so that gather_mm treats
+        # each token as a batched (1 x hidden) operand, selecting one expert
+        # weight matrix per token via rhs_indices.
+        # Output: (tokens*top_k, 1, expert_hidden).
+        x_rep = mx.repeat(x, repeats=top_k, axis=0)  # (tokens*top_k, hidden)
+        x_rep = x_rep.reshape(tokens * top_k, 1, hidden)
+        mx.eval(x, w, rhs_idx, x_rep)
+        def run():
+            return mx.gather_mm(x_rep, w, rhs_indices=rhs_idx)
+        return run
+    def flops(s):
+        return (2 * s["tokens"] * s["top_k"]
+                * s["hidden"] * s["expert_hidden"])
+    return Case(
+        "gather",
+        {"tokens": tokens, "E": E, "hidden": hidden,
+         "expert_hidden": expert_hidden, "top_k": top_k},
+        build, flops)
+
+
+def _sdpa_prefill(B: int, H: int, kL: int, hd: int) -> Case:
+    """Self-attention prefill: q,k,v all at length kL. fp16 inputs, no mask.
+    On g16 this routes through attention_nax_g16 with NAXFrag32 + wm=2.
+    """
+    def build():
+        q = mx.random.normal((B, H, kL, hd)).astype(mx.float16)
+        k = mx.random.normal((B, H, kL, hd)).astype(mx.float16)
+        v = mx.random.normal((B, H, kL, hd)).astype(mx.float16)
+        scale = 1.0 / math.sqrt(hd)
+        mx.eval(q, k, v)
+        def run():
+            return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale)
+        return run
+    def flops(s):
+        # 4 * B * H * kL * kL * hd: Q@K^T (2BH kL^2 hd) + S@V (2BH kL^2 hd).
+        return 4 * s["B"] * s["H"] * s["kL"] * s["kL"] * s["hd"]
+    return Case(
+        "sdpa_prefill",
+        {"B": B, "H": H, "kL": kL, "hd": hd},
+        build, flops)
+
+
 def all_cases() -> list[Case]:
     return [
-        # Llama-7B prefill shapes and a shorter boundary.
+        # Matmul (Task 3).
         _gemm_fused(M=2048, N=4096, K=4096),
         _gemm_fused(M=2048, N=11008, K=4096),
         _gemm_fused(M=512, N=4096, K=4096),
-        # Small-MN-large-K splitk regime.
         _gemm_splitk(M=64, N=64, K=8192),
         _gemm_splitk(M=128, N=128, K=4096),
-        # Batched matmul.
         _gemm_segmented(B=8, M=512, N=4096, K=4096),
         _gemm_segmented(B=32, M=128, N=128, K=128),
+        # Gather (MoE prefill, bm>=32).
+        _gather(tokens=2048, E=8, hidden=4096, expert_hidden=14336, top_k=2),
+        _gather(tokens=512, E=8, hidden=4096, expert_hidden=4096, top_k=2),
+        # SDPA prefill (fp16, no bool mask).
+        _sdpa_prefill(B=1, H=32, kL=2048, hd=128),
+        _sdpa_prefill(B=1, H=32, kL=8192, hd=128),
+        _sdpa_prefill(B=1, H=32, kL=512, hd=128),
+        _sdpa_prefill(B=1, H=32, kL=2048, hd=64),
     ]
 
 
