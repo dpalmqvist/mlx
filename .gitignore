@@ -79,3 +79,6 @@ uv.lock
 .cache/
 # vim
 *.swp
+
+# nax_g16_perf_bench.py default output
+nax_g16_perf_*.json
