@@ -31,6 +31,16 @@ void sdpa_full_self_attention_nax(
   int wm = 4;
   int wn = 1;
 
+  // Phase 7: g16 NAX SDPA uses NAXFrag32 (kFragRows=32). Existing
+  // instantiations have SQ = bq/wm = 16 which doesn't fit. Use wm=2
+  // so SQ=32 and dispatch matches the _g16 instantiation.
+  const bool g16 =
+      metal::is_nax_available() &&
+      metal::nax_arch_flavor() == metal::NAXArchFlavor::kG16;
+  if (g16) {
+    wm = 2;
+  }
+
   int bd = q.shape(-1);
   int bq = 64;
   int bk = 32;
@@ -73,6 +83,13 @@ void sdpa_full_self_attention_nax(
       wn,
       "_mask",
       type_to_name(has_mask ? *mask : q));
+
+  // Phase 7: append _g16 to base_name so the kernel lookup selects the
+  // NAXFrag32 instantiation. Must happen before hash_name is built so the
+  // suffix order is ..._g16_align_Q_..._has_sinks_t.
+  if (g16) {
+    base_name += "_g16";
+  }
 
   std::string hash_name;
   concatenate(
@@ -147,8 +164,15 @@ void sdpa_full_self_attention_nax(
   if (has_mask) {
     auto& m = *mask;
 
-    AttnMaskParams mask_params{/* int64_t M_strides[3] = */ {
-        m.strides(0), m.strides(1), m.strides(2)}};
+    // Use shape-aware strides: if a dimension has size 1, its stride is 0 so
+    // the GPU-side pointer advance stays within the single valid row/head/batch.
+    // This mirrors the non-NAX dispatcher (lines ~426-429 below).
+    const int64_t m_s0 = m.shape(0) > 1 ? m.strides(0) : 0;
+    const int64_t m_s1 = m.shape(1) > 1 ? m.strides(1) : 0;
+    const int64_t m_s2 = m.shape(2) > 1 ? m.strides(2) : 0;
+
+    AttnMaskParams mask_params{/* int64_t M_strides[3] = */ {m_s0, m_s1, m_s2},
+        /* int M_q_size = */ int(m.shape(2))};
 
     compute_encoder.set_bytes(mask_params, 5);
     compute_encoder.set_input_array(m, 6);
@@ -174,7 +198,13 @@ void sdpa_full_self_attention_metal(
     bool do_causal_,
     const std::optional<array>& mask,
     const std::optional<array>& sinks) {
+  const bool g16 = metal::is_nax_available() &&
+      metal::nax_arch_flavor() == metal::NAXArchFlavor::kG16;
+  const bool g16_mask_bool = g16 && mask.has_value() &&
+      mask->dtype() == bool_;
+
   if (metal::is_nax_available() && q.shape(3) != 80 &&
+      !g16_mask_bool &&
       (env::enable_tf32() || q.dtype() != float32)) {
     return sdpa_full_self_attention_nax(
         /* const Stream& s = */ s,
@@ -310,8 +340,14 @@ void sdpa_full_self_attention_metal(
   if (has_mask) {
     auto& m = *mask;
 
-    AttnMaskParams mask_params{/* int64_t M_strides[3] = */ {
-        m.strides(0), m.strides(1), m.strides(2)}};
+    // Use shape-aware strides: if a dimension has size 1, its stride is 0 so
+    // the GPU-side pointer advance stays within the single valid row/head/batch.
+    const int64_t m_s0 = m.shape(0) > 1 ? m.strides(0) : 0;
+    const int64_t m_s1 = m.shape(1) > 1 ? m.strides(1) : 0;
+    const int64_t m_s2 = m.shape(2) > 1 ? m.strides(2) : 0;
+
+    AttnMaskParams mask_params{/* int64_t M_strides[3] = */ {m_s0, m_s1, m_s2},
+        /* int M_q_size = */ int(m.shape(2))};
 
     compute_encoder.set_bytes(mask_params, 5);
     compute_encoder.set_input_array(m, 6);

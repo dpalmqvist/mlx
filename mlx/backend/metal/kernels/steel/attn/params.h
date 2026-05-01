@@ -38,6 +38,7 @@ struct AttnParams {
 
 struct AttnMaskParams {
   int64_t M_strides[3]; ///< Mask  strides (B, H, qL, kL = 1)
+  int M_q_size;         ///< Mask Q dimension size (mask.shape(2)); 1 for shape-(1,*,1,kL) masks
 };
 
 } // namespace steel
