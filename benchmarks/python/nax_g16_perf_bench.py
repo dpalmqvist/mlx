@@ -51,21 +51,63 @@ class Case:
         return " ".join(f"{k}={v}" for k, v in self.shape.items())
 
 
-def _smoke_matmul_case() -> Case:
+def _gemm_fused(M: int, N: int, K: int) -> Case:
     def build():
-        a = mx.random.normal((128, 128)).astype(mx.float16)
-        b = mx.random.normal((128, 128)).astype(mx.float16)
+        a = mx.random.normal((M, K)).astype(mx.float16)
+        b = mx.random.normal((K, N)).astype(mx.float16)
         mx.eval(a, b)
         def run():
             return a @ b
         return run
     def flops(s):
         return 2 * s["M"] * s["N"] * s["K"]
-    return Case("smoke", {"M": 128, "N": 128, "K": 128}, build, flops)
+    return Case("gemm_fused", {"M": M, "N": N, "K": K}, build, flops)
+
+
+def _gemm_splitk(M: int, N: int, K: int) -> Case:
+    """Same op as gemm_fused; small-MN-large-K shape regime where the
+    dispatcher selects steel_gemm_splitk on g16."""
+    def build():
+        a = mx.random.normal((M, K)).astype(mx.float16)
+        b = mx.random.normal((K, N)).astype(mx.float16)
+        mx.eval(a, b)
+        def run():
+            return a @ b
+        return run
+    def flops(s):
+        return 2 * s["M"] * s["N"] * s["K"]
+    return Case("gemm_splitk", {"M": M, "N": N, "K": K}, build, flops)
+
+
+def _gemm_segmented(B: int, M: int, N: int, K: int) -> Case:
+    """Batched matmul; dispatcher picks the segmented kernel on batched
+    input."""
+    def build():
+        a = mx.random.normal((B, M, K)).astype(mx.float16)
+        b = mx.random.normal((B, K, N)).astype(mx.float16)
+        mx.eval(a, b)
+        def run():
+            return a @ b
+        return run
+    def flops(s):
+        return 2 * s["B"] * s["M"] * s["N"] * s["K"]
+    return Case("gemm_segmented",
+                {"B": B, "M": M, "N": N, "K": K}, build, flops)
 
 
 def all_cases() -> list[Case]:
-    return [_smoke_matmul_case()]
+    return [
+        # Llama-7B prefill shapes and a shorter boundary.
+        _gemm_fused(M=2048, N=4096, K=4096),
+        _gemm_fused(M=2048, N=11008, K=4096),
+        _gemm_fused(M=512, N=4096, K=4096),
+        # Small-MN-large-K splitk regime.
+        _gemm_splitk(M=64, N=64, K=8192),
+        _gemm_splitk(M=128, N=128, K=4096),
+        # Batched matmul.
+        _gemm_segmented(B=8, M=512, N=4096, K=4096),
+        _gemm_segmented(B=32, M=128, N=128, K=128),
+    ]
 
 
 # ---- Timing ---------------------------------------------------------------
