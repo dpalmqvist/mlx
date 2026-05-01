@@ -488,6 +488,14 @@ def test_mma_register_only():
 
     Per spec, dtype_frag_t element i lives at (a + dr[i % 8], b + dc[i / 8])
     where (b, a) is get_coord() (returned as short2{col, row}).
+
+    NOTE: FT/TF/TT register-only variants were attempted during Phase 6 Task 3
+    and failed (~1000+ bad cells each). This confirms that MPP's per-thread
+    register layout is NOT invariant under the transpose descriptor variant —
+    the dr/dc table probed in tools/probe_nax_descriptor.py is specific to the
+    (false, false) descriptor. Transpose correctness is instead covered by the
+    load+mma path in tools/probe_naxfrag32_transpose.py, which exercises the
+    correct load→mma→store sequence for each transpose configuration.
     """
     src = """
     constexpr int M = 32, N = 32, K = 32;

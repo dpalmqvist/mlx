@@ -63,19 +63,21 @@ auto gemm_loop(
       const int B_offset = transpose_b ? k : k * ldb;
 
       if constexpr (kAlignedM) {
-        Atile.load(A + A_offset, lda, scratch);
+        Atile.template load<Role::Left, transpose_a>(A + A_offset, lda, scratch);
       } else {
         const short rmax = transpose_a ? SK : sgp_sm;
         const short cmax = transpose_a ? sgp_sm : SK;
-        Atile.load_safe(A + A_offset, lda, short2(cmax, rmax), scratch);
+        Atile.template load_safe<Role::Left, transpose_a>(
+            A + A_offset, lda, short2(cmax, rmax), scratch);
       }
 
       if constexpr (kAlignedN) {
-        Btile.load(B + B_offset, ldb, scratch);
+        Btile.template load<Role::Right, transpose_b>(B + B_offset, ldb, scratch);
       } else {
         const short rmax = transpose_b ? sgp_sn : SK;
         const short cmax = transpose_b ? SK : sgp_sn;
-        Btile.load_safe(B + B_offset, ldb, short2(cmax, rmax), scratch);
+        Btile.template load_safe<Role::Right, transpose_b>(
+            B + B_offset, ldb, short2(cmax, rmax), scratch);
       }
 
       tile_matmad_nax(
@@ -111,8 +113,10 @@ auto gemm_loop(
       const int A_offset = transpose_a ? k * lda : k;
       const int B_offset = transpose_b ? k : k * ldb;
 
-      Atile.load_safe(A + A_offset, lda, Aklims, scratch);
-      Btile.load_safe(B + B_offset, ldb, Bklims, scratch);
+      Atile.template load_safe<Role::Left, transpose_a>(
+          A + A_offset, lda, Aklims, scratch);
+      Btile.template load_safe<Role::Right, transpose_b>(
+          B + B_offset, ldb, Bklims, scratch);
 
       tile_matmad_nax(
           Dtile,
