@@ -1,0 +1,21 @@
+running NAX-on arm ...
+running NAX-off arm ...
+preflight: NAX-on arm: available=True flavor=g16
+preflight: NAX-off arm: available=False flavor=none
+
+kernel          shape                                                nax_on    nax_off   speedup   TFLOPS
+gemm_fused      M=2048 N=4096 K=4096                               13.437ms    9.384ms     0.70x     5.11
+gemm_fused      M=2048 N=11008 K=4096                              38.649ms   24.667ms     0.64x     4.78
+gemm_fused      M=512 N=4096 K=4096                                 3.430ms    2.540ms     0.74x     5.01
+gemm_splitk     M=64 N=64 K=8192                                    0.340ms    0.130ms     0.38x     0.20
+gemm_splitk     M=128 N=128 K=4096                                  0.222ms    0.138ms     0.62x     0.60
+gemm_segmented  B=8 M=512 N=4096 K=4096                            26.930ms   18.356ms     0.68x     5.10
+gemm_segmented  B=32 M=128 N=128 K=128                              0.177ms    0.135ms     0.76x     0.76
+gather          tokens=2048 E=8 hidden=4096 expert_hidden=14336 top_k=2  1769.076ms  1749.483ms     0.99x     0.27
+gather          tokens=512 E=8 hidden=4096 expert_hidden=4096 top_k=2  122.561ms  122.145ms     1.00x     0.28
+sdpa_prefill    B=1 H=32 kL=2048 hd=128                            23.359ms   10.476ms     0.45x     2.94
+sdpa_prefill    B=1 H=32 kL=8192 hd=128                           377.342ms  164.726ms     0.44x     2.91
+sdpa_prefill    B=1 H=32 kL=512 hd=128                              1.707ms    0.855ms     0.50x     2.52
+sdpa_prefill    B=1 H=32 kL=2048 hd=64                              6.750ms    5.248ms     0.78x     5.09
+
+wrote nax_g16_perf_1777706561.json
