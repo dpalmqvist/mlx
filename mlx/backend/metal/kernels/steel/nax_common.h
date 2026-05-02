@@ -1589,6 +1589,48 @@ METAL_FUNC void tile_matmad_nax(
   constexpr auto tb = metal::bool_constant<transpose_b>{};
 
   if constexpr (CTile::NAXFrag_t::kPacking == 1) {
+#if MLX_NAX_DIAG_VARIANT == 3
+    // V3 hoisted-op: construct gemm_op + cooperative tensors once before
+    // the K-loop and reuse across (mm, nn, kk). Inlines the body of
+    // NAXFrag32::mma to avoid a new function-overload signature.
+    using CType = typename CTile::elem_type;
+    using AType = typename ATile::elem_type;
+    using BType = typename BTile::elem_type;
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+        32, 32, 32,
+        transpose_a,
+        transpose_b,
+        true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> gemm_op;
+    auto ct_a = gemm_op.template get_left_input_cooperative_tensor<AType, BType, CType>();
+    auto ct_b = gemm_op.template get_right_input_cooperative_tensor<AType, BType, CType>();
+    auto ct_c = gemm_op.template get_destination_cooperative_tensor<
+        decltype(ct_a), decltype(ct_b), CType>();
+    constexpr short kEPF = CTile::NAXFrag_t::kElemsPerFrag;
+
+    STEEL_PRAGMA_UNROLL
+    for (short mm = 0; mm < TM; ++mm) {
+      STEEL_PRAGMA_UNROLL
+      for (short nn = 0; nn < TN; ++nn) {
+        STEEL_PRAGMA_UNROLL
+        for (short kk = 0; kk < TK; ++kk) {
+          thread auto& Cf = C.frag_at(mm, nn);
+          thread const auto& Af = A.frag_at(mm, kk, ta);
+          thread const auto& Bf = B.frag_at(kk, nn, tb);
+          STEEL_PRAGMA_UNROLL
+          for (short i = 0; i < kEPF; i++) {
+            ct_a[i] = Af[i]; ct_b[i] = Bf[i]; ct_c[i] = Cf[i];
+          }
+          gemm_op.run(ct_a, ct_b, ct_c);
+          STEEL_PRAGMA_UNROLL
+          for (short i = 0; i < kEPF; i++) {
+            Cf[i] = ct_c[i];
+          }
+        }
+      }
+    }
+#else
     // Single-frag mma: one 32x32 output per MMA. Used by NAXFrag32 (g16 path).
     STEEL_PRAGMA_UNROLL
     for (short mm = 0; mm < TM; ++mm) {
@@ -1605,6 +1647,7 @@ METAL_FUNC void tile_matmad_nax(
         }
       }
     }
+#endif
   } else if constexpr (TN == 1 && TM % 2 == 0) {
     STEEL_PRAGMA_UNROLL
     for (short mm = 0; mm < TM; mm += 2) {
