@@ -88,15 +88,20 @@ void segmented_mm_nax(
   Dtile.clear();
 
   // Threadgroup scratch for the NAXFrag32 (kPacking==1) path; mirrors
-  // splitk_nax / fused_nax. BaseNAXFrag (kPacking==2) keeps a 1-element
-  // placeholder since Metal rejects zero-sized tg arrays.
+  // splitk_nax / fused_nax. Doubled per simdgroup so Atile and Btile can
+  // stage in parallel (Phase 8 prototype B).
+  constexpr int kFragArea = NAXFrag_::kFragRows * NAXFrag_::kFragCols;
   constexpr int kScratchSize = (NAXFrag_::kPacking == 1)
-      ? (WM * WN * NAXFrag_::kFragRows * NAXFrag_::kFragCols)
+      ? (WM * WN * 2 * kFragArea)
       : 1;
   threadgroup AccumType scratch_buf[kScratchSize];
-  threadgroup AccumType* sg_scratch =
+  threadgroup AccumType* sg_scratch_a =
       (NAXFrag_::kPacking == 1)
-          ? (scratch_buf + simd_group_id * (NAXFrag_::kFragRows * NAXFrag_::kFragCols))
+          ? (scratch_buf + simd_group_id * 2 * kFragArea)
+          : nullptr;
+  threadgroup AccumType* sg_scratch_b =
+      (NAXFrag_::kPacking == 1)
+          ? (scratch_buf + simd_group_id * 2 * kFragArea + kFragArea)
           : nullptr;
 
   const int segment_k_size = k_end - k_start;
@@ -127,7 +132,8 @@ void segmented_mm_nax(
             segment_k_iters,
             sgp_sm,
             sgp_sn,
-            (threadgroup T*)sg_scratch);
+            (threadgroup T*)sg_scratch_a,
+            (threadgroup T*)sg_scratch_b);
       });
     });
   });
@@ -135,9 +141,9 @@ void segmented_mm_nax(
   dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(align_N || !is_unaligned_sn, [&](auto kAlignedN) {
       if constexpr (kAlignedM && kAlignedN) {
-        Dtile.store(C, int(params->ldd), sg_scratch);
+        Dtile.store(C, int(params->ldd), sg_scratch_a);
       } else {
-        Dtile.store_safe(C, int(params->ldd), short2(sgp_sn, sgp_sm), sg_scratch);
+        Dtile.store_safe(C, int(params->ldd), short2(sgp_sn, sgp_sm), sg_scratch_a);
       }
     });
   });

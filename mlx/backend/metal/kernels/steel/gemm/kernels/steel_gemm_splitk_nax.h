@@ -110,13 +110,18 @@ template <
   // the contiguous-tg cooperative-tensor load. For BaseNAXFrag (kPacking==2),
   // size 1 keeps the array non-zero (Metal rejects zero-sized tg arrays); the
   // BaseNAXFrag path never reads scratch_buf.
+  constexpr int kFragArea = NAXFrag_::kFragRows * NAXFrag_::kFragCols;
   constexpr int kScratchSize = (NAXFrag_::kPacking == 1)
-      ? (WM * WN * NAXFrag_::kFragRows * NAXFrag_::kFragCols)
+      ? (WM * WN * 2 * kFragArea)  // 2x for A/B double-buffering
       : 1;
   threadgroup AccumType scratch_buf[kScratchSize];
-  threadgroup AccumType* sg_scratch =
+  threadgroup AccumType* sg_scratch_a =
       (NAXFrag_::kPacking == 1)
-          ? (scratch_buf + simd_group_id * (NAXFrag_::kFragRows * NAXFrag_::kFragCols))
+          ? (scratch_buf + simd_group_id * 2 * kFragArea)
+          : nullptr;
+  threadgroup AccumType* sg_scratch_b =
+      (NAXFrag_::kPacking == 1)
+          ? (scratch_buf + simd_group_id * 2 * kFragArea + kFragArea)
           : nullptr;
 
   // gemm_loop through the partition
@@ -149,7 +154,8 @@ template <
             partition_k_iters,
             sgp_sm,
             sgp_sn,
-            (threadgroup T*)sg_scratch);
+            (threadgroup T*)sg_scratch_a,
+            (threadgroup T*)sg_scratch_b);
       });
     });
   });
@@ -158,9 +164,9 @@ template <
   dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(align_N || !is_unaligned_sn, [&](auto kAlignedN) {
       if constexpr (kAlignedM && kAlignedN) {
-        Dtile.store(C, int(params->ldc), sg_scratch);
+        Dtile.store(C, int(params->ldc), sg_scratch_a);
       } else {
-        Dtile.store_safe(C, int(params->ldc), short2(sgp_sn, sgp_sm), sg_scratch);
+        Dtile.store_safe(C, int(params->ldc), short2(sgp_sn, sgp_sm), sg_scratch_a);
       }
     });
   });

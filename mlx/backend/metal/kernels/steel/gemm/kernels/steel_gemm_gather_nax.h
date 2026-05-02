@@ -71,18 +71,22 @@ gather_mm_rhs_nax(
   rhs_indices += tm;
 
   // Threadgroup scratch for the NAXFrag32 (kPacking==1) path. Mirrors the
-  // splitk_nax kernel: each simdgroup gets its own kFragRows*kFragCols slice
-  // used by NAXTile's safe/rows methods to stage device <-> register through
-  // the contiguous-tg cooperative-tensor load. For BaseNAXFrag (kPacking==2),
-  // size 1 keeps the array non-zero (Metal rejects zero-sized tg arrays); the
-  // BaseNAXFrag path never reads scratch_buf.
+  // splitk_nax/fused_nax kernels. Doubled per simdgroup so Atile and Btile
+  // can stage in parallel (Phase 8 prototype B). For BaseNAXFrag
+  // (kPacking==2), size 1 keeps the array non-zero (Metal rejects zero-sized
+  // threadgroup arrays); the BaseNAXFrag path never reads scratch_buf.
+  constexpr int kFragArea = NAXFrag_::kFragRows * NAXFrag_::kFragCols;
   constexpr int kScratchSize = (NAXFrag_::kPacking == 1)
-      ? (WM * WN * NAXFrag_::kFragRows * NAXFrag_::kFragCols)
+      ? (WM * WN * 2 * kFragArea)
       : 1;
   threadgroup AccumType scratch_buf[kScratchSize];
-  threadgroup AccumType* sg_scratch =
+  threadgroup AccumType* sg_scratch_a =
       (NAXFrag_::kPacking == 1)
-          ? (scratch_buf + simd_group_id * (NAXFrag_::kFragRows * NAXFrag_::kFragCols))
+          ? (scratch_buf + simd_group_id * 2 * kFragArea)
+          : nullptr;
+  threadgroup AccumType* sg_scratch_b =
+      (NAXFrag_::kPacking == 1)
+          ? (scratch_buf + simd_group_id * 2 * kFragArea + kFragArea)
           : nullptr;
 
   // Do as many matmuls as necessary
@@ -132,18 +136,19 @@ gather_mm_rhs_nax(
               params->gemm_k_iterations_aligned,
               sgp_sm,
               sgp_sn,
-              (threadgroup T*)sg_scratch);
+              (threadgroup T*)sg_scratch_a,
+              (threadgroup T*)sg_scratch_b);
 
           if constexpr (kAlignedN.value) {
             if (offset_next - offset == SM) {
-              Ctile.store(C, int(params->ldd), sg_scratch);
+              Ctile.store(C, int(params->ldd), sg_scratch_a);
             } else {
               Ctile.store_slice(
                   C,
                   int(params->ldd),
                   short2(0, offset),
                   short2(SN, offset_next),
-                  sg_scratch);
+                  sg_scratch_a);
             }
           } else {
             Ctile.store_slice(
@@ -151,7 +156,7 @@ gather_mm_rhs_nax(
                 int(params->ldd),
                 short2(0, offset),
                 short2(sgp_sn, offset_next),
-                sg_scratch);
+                sg_scratch_a);
           }
         });
       });
