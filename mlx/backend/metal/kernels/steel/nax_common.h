@@ -672,7 +672,17 @@ struct NAXFrag32 {
       ct_c[i] = C[i];
     }
 
+#if MLX_NAX_DIAG_VARIANT == 1
+    // V1 no-mma: skip gemm_op.run(); fold ct_a/ct_b into ct_c via add to
+    // keep loads alive (DCE-resistant). Output is wrong; bench only.
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemsPerFrag; i++) {
+      ct_c[i] = ct_c[i] + static_cast<CType>(static_cast<float>(ct_a[i]) +
+                                              static_cast<float>(ct_b[i]));
+    }
+#else
     gemm_op.run(ct_a, ct_b, ct_c);
+#endif
 
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kElemsPerFrag; i++) {
