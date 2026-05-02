@@ -33,8 +33,7 @@ auto gemm_loop(
     int gemm_k_iterations_aligned,
     const short sgp_sm,
     const short sgp_sn,
-    threadgroup T* scratch_a,
-    threadgroup T* scratch_b) {
+    threadgroup T* scratch) {
   constexpr short TM = SM / NAXFrag_::kFragRows;
   constexpr short TN = SN / NAXFrag_::kFragCols;
   constexpr short TK = SK / NAXFrag_::kFragRows;
@@ -64,21 +63,21 @@ auto gemm_loop(
       const int B_offset = transpose_b ? k : k * ldb;
 
       if constexpr (kAlignedM) {
-        Atile.template load<Role::Left, transpose_a>(A + A_offset, lda, scratch_a);
+        Atile.template load<Role::Left, transpose_a>(A + A_offset, lda, scratch);
       } else {
         const short rmax = transpose_a ? SK : sgp_sm;
         const short cmax = transpose_a ? sgp_sm : SK;
         Atile.template load_safe<Role::Left, transpose_a>(
-            A + A_offset, lda, short2(cmax, rmax), scratch_a);
+            A + A_offset, lda, short2(cmax, rmax), scratch);
       }
 
       if constexpr (kAlignedN) {
-        Btile.template load<Role::Right, transpose_b>(B + B_offset, ldb, scratch_b);
+        Btile.template load<Role::Right, transpose_b>(B + B_offset, ldb, scratch);
       } else {
         const short rmax = transpose_b ? sgp_sn : SK;
         const short cmax = transpose_b ? SK : sgp_sn;
         Btile.template load_safe<Role::Right, transpose_b>(
-            B + B_offset, ldb, short2(cmax, rmax), scratch_b);
+            B + B_offset, ldb, short2(cmax, rmax), scratch);
       }
 
       tile_matmad_nax(
@@ -115,9 +114,9 @@ auto gemm_loop(
       const int B_offset = transpose_b ? k : k * ldb;
 
       Atile.template load_safe<Role::Left, transpose_a>(
-          A + A_offset, lda, Aklims, scratch_a);
+          A + A_offset, lda, Aklims, scratch);
       Btile.template load_safe<Role::Right, transpose_b>(
-          B + B_offset, ldb, Bklims, scratch_b);
+          B + B_offset, ldb, Bklims, scratch);
 
       tile_matmad_nax(
           Dtile,

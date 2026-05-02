@@ -232,18 +232,13 @@ template <
   // For BaseNAXFrag (kPacking==2), `1` keeps the array non-zero-sized (Metal
   // rejects zero-sized threadgroup arrays); the BaseNAXFrag path never reads
   // scratch_buf, so the 4-byte cost is negligible.
-  constexpr int kFragArea = NAXFrag_::kFragRows * NAXFrag_::kFragCols;
   constexpr int kScratchSize = (NAXFrag_::kPacking == 1)
-      ? (WM * WN * 2 * kFragArea)  // 2x for A/B double-buffering
+      ? (WM * WN * NAXFrag_::kFragRows * NAXFrag_::kFragCols)
       : 1;
   threadgroup AccumType scratch_buf[kScratchSize];
-  threadgroup AccumType* sg_scratch_a =
+  threadgroup AccumType* sg_scratch =
       (NAXFrag_::kPacking == 1)
-          ? (scratch_buf + simd_group_id * 2 * kFragArea)
-          : nullptr;
-  threadgroup AccumType* sg_scratch_b =
-      (NAXFrag_::kPacking == 1)
-          ? (scratch_buf + simd_group_id * 2 * kFragArea + kFragArea)
+          ? (scratch_buf + simd_group_id * (NAXFrag_::kFragRows * NAXFrag_::kFragCols))
           : nullptr;
 
   dispatch_bool(align_K, [&](auto kAlignedK) {
@@ -270,16 +265,15 @@ template <
             params->gemm_k_iterations_aligned,
             sgp_sm,
             sgp_sn,
-            (threadgroup T*)sg_scratch_a,
-            (threadgroup T*)sg_scratch_b);
+            (threadgroup T*)sg_scratch);
         if (use_out_source) {
           gemm_epilogue<kAlignedM.value, kAlignedN.value>(
-              Dtile, C, params, addmm_params, sgp_sm, sgp_sn, sg_scratch_a);
+              Dtile, C, params, addmm_params, sgp_sm, sgp_sn, sg_scratch);
         }
         if constexpr (kAlignedM && kAlignedN) {
-          Dtile.store(D, int(params->ldd), sg_scratch_a);
+          Dtile.store(D, int(params->ldd), sg_scratch);
         } else {
-          Dtile.store_safe(D, int(params->ldd), short2(sgp_sn, sgp_sm), sg_scratch_a);
+          Dtile.store_safe(D, int(params->ldd), short2(sgp_sn, sgp_sm), sg_scratch);
         }
       });
     });
