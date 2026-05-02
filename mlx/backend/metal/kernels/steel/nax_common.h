@@ -775,52 +775,6 @@ struct NAXFrag32 {
     }
   }
 
-  // Phase 8 prototype A': register-only direct load from device memory.
-  // Bypasses scratch staging on the aligned, non-transposed fast path.
-  // Builds the same op/descriptor as load(device, ld) and the same
-  // device-memory tensor_inline view as store(device, ld), then has the
-  // cooperative_tensor pull elements directly from device memory.
-  //
-  // const_cast<device U*>(src) drops the const qualifier required by MPP's
-  // load(view) signature; cooperative_tensor::load only reads from view, so
-  // this cast does not introduce write access.
-  //
-  // transpose=true is not supported on this fast path (use load() with
-  // scratch instead); enforced by static_assert at compile time.
-  template <Role role, bool transpose, typename T, typename U>
-  METAL_FUNC static void load_direct(
-      thread dtype_frag_t<T>& dst,
-      const device U* src,
-      const int ld) {
-    static_assert(!transpose,
-                  "NAXFrag32::load_direct: transpose=true not supported "
-                  "on the register-only fast path; use load() with scratch.");
-
-    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-        32, 32, 32,
-        /*transpose_left=*/  (role == Role::Left)  ? transpose : false,
-        /*transpose_right=*/ (role == Role::Right) ? transpose : false,
-        /*relaxed_precision=*/true,
-        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
-    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
-
-    metal::dextents<int32_t, 2> ext(32, ld);
-    metal::tensor<device U, metal::dextents<int32_t, 2>, metal::tensor_inline>
-        view(const_cast<device U*>(src), ext);
-
-    if constexpr (role == Role::Right) {
-      auto ct = op.template get_right_input_cooperative_tensor<U, U, U>();
-      ct.load(view);
-      STEEL_PRAGMA_UNROLL
-      for (short i = 0; i < kElemsPerFrag; i++) dst[i] = static_cast<T>(ct[i]);
-    } else {
-      auto ct = op.template get_left_input_cooperative_tensor<U, U, U>();
-      ct.load(view);
-      STEEL_PRAGMA_UNROLL
-      for (short i = 0; i < kElemsPerFrag; i++) dst[i] = static_cast<T>(ct[i]);
-    }
-  }
-
   // Device-memory variant of the contiguous store. Same body as the
   // threadgroup overload with the address space swapped, plus support for
   // T != U: the destination cooperative tensor is parameterized on the
@@ -1227,28 +1181,19 @@ struct NAXTile {
   METAL_FUNC void load(const device U* src, const int ld,
                        threadgroup elem_type* scratch) {
     if constexpr (NAXFrag_t::kPacking == 1) {
-      // kPacking==1 path: Phase 8 prototype A' — non-transposed aligned loads
-      // bypass threadgroup scratch staging via NAXFrag32::load_direct, which
-      // constructs a tensor_inline view directly over device memory and has the
-      // cooperative tensor pull from it. Transposed loads still stage through
-      // threadgroup scratch via load_rows (the pre-A' path).
+      // kPacking==1 path: NAXFrag32's cooperative-tensor device load only
+      // works correctly when ld == kFragCols (==32). For any other stride,
+      // stage through threadgroup scratch (same as load_rows with full rows).
       const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
         const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
           constexpr short m_off = idx_row.value * kFragRows;
           constexpr short n_off = idx_col.value * kFragCols;
-          if constexpr (!transpose) {
-            NAXFrag_t::template load_direct<role, transpose>(
-                frag_at<idx_row.value, idx_col.value>(),
-                src + m_off * ld + n_off,
-                ld);
-          } else {
-            NAXFrag_t::template load_rows<role, transpose>(
-                frag_at<idx_row.value, idx_col.value>(),
-                src + m_off * ld + n_off,
-                ld,
-                short(kFragRows),
-                scratch);
-          }
+          NAXFrag_t::template load_rows<role, transpose>(
+              frag_at<idx_row.value, idx_col.value>(),
+              src + m_off * ld + n_off,
+              ld,
+              short(kFragRows),
+              scratch);
         });
       });
     } else {
