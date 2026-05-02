@@ -1,0 +1,10 @@
+running NAX-on arm ...
+running NAX-off arm ...
+preflight: NAX-on arm: available=True flavor=g16
+preflight: NAX-off arm: available=False flavor=none
+
+kernel          shape                                                nax_on    nax_off   speedup   TFLOPS
+gemm_splitk     M=64 N=64 K=8192                                    0.672ms    0.638ms     0.95x     0.10
+gemm_fused      M=2048 N=4096 K=4096                                6.862ms    9.299ms     1.36x    10.01
+
+wrote /tmp/phase9_v1.json
