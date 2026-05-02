@@ -82,3 +82,6 @@ uv.lock
 
 # nax_g16_perf_bench.py default output
 nax_g16_perf_*.json
+
+# Phase 8 Metal GPU capture bundles (large binary, not checked in)
+docs/superpowers/reports/2026-05-01-nax-g16-phase8-captures/

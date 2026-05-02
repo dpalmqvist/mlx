@@ -840,7 +840,7 @@ struct NAXFrag32 {
       scratch[r * 32 + c] =
           (r < row_lim && c < col_lim) ? static_cast<T>(src[r * ld + c]) : T(0);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
     load<role, transpose>(dst, scratch, /*ld=*/short(32));
   }
 
@@ -865,7 +865,7 @@ struct NAXFrag32 {
       scratch[r * 32 + c] =
           (r < row_lim) ? static_cast<T>(src[r * ld + c]) : T(0);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
     load<role, transpose>(dst, scratch, /*ld=*/short(32));
   }
 
@@ -880,7 +880,7 @@ struct NAXFrag32 {
       const short col_lim,
       threadgroup T* scratch) {
     store(src, scratch, /*ld=*/short(32));
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
     const ushort lane = __metal_get_thread_index_in_simdgroup(ushort());
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kElemsPerFrag; ++i) {
@@ -904,7 +904,7 @@ struct NAXFrag32 {
       const short row_lim,
       threadgroup T* scratch) {
     store(src, scratch, /*ld=*/short(32));
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
     const ushort lane = __metal_get_thread_index_in_simdgroup(ushort());
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kElemsPerFrag; ++i) {
@@ -985,7 +985,7 @@ struct NAXFrag32 {
       OffY off_y = Int<0>{}) {
     // Stage the 32x32 frag to threadgroup scratch via the contiguous store.
     store(src, scratch, /*ld=*/short(32));
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
 
     // Per-thread bounded copy: each lane owns kElemsPerFrag (=32) elements.
     // Address them by flat index: flat = lane * 32 + i, r = flat / 32,

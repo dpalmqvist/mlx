@@ -178,11 +178,19 @@ def all_cases() -> list[Case]:
 
 # ---- Timing ---------------------------------------------------------------
 
-def time_case(case: Case, warmup: int = 3, iters: int = 10) -> dict:
+def time_case(case: Case, warmup: int = 3, iters: int = 10,
+              capture_path: str | None = None) -> dict:
     run = case.build()
     for _ in range(warmup):
         mx.eval(run())
     mx.synchronize()
+
+    if capture_path is not None:
+        mx.metal.start_capture(capture_path)
+        mx.eval(run())
+        mx.synchronize()
+        mx.metal.stop_capture()
+
     samples = []
     for _ in range(iters):
         tic = time.perf_counter()
@@ -209,8 +217,16 @@ def child_main(label: str) -> int:
         "nax_available": mx.metal.is_nax_available(),
         "nax_flavor": mx.metal.nax_arch_flavor(),
     }), flush=True)
+    capture_dir = os.environ.get("MLX_NAX_BENCH_CAPTURE_DIR")
     for case in all_cases():
-        rec = time_case(case)
+        capture_path = None
+        if capture_dir is not None:
+            shape_slug = "_".join(f"{k}{v}" for k, v in case.shape.items())
+            capture_path = os.path.join(
+                capture_dir,
+                f"{label}__{case.kernel_label}__{shape_slug}.gputrace",
+            )
+        rec = time_case(case, capture_path=capture_path)
         rec["arm"] = label
         print(json.dumps(rec), flush=True)
     return 0
@@ -218,12 +234,16 @@ def child_main(label: str) -> int:
 
 # ---- Orchestrator ---------------------------------------------------------
 
-def run_child(arm: str, disable_nax: bool) -> tuple[dict, list[dict]]:
+def run_child(arm: str, disable_nax: bool, capture_dir: str | None = None) -> tuple[dict, list[dict]]:
     env = dict(os.environ)
     if disable_nax:
         env["MLX_DISABLE_NAX"] = "1"
     else:
         env.pop("MLX_DISABLE_NAX", None)
+    if capture_dir is not None:
+        env["MLX_NAX_BENCH_CAPTURE_DIR"] = capture_dir
+    else:
+        env.pop("MLX_NAX_BENCH_CAPTURE_DIR", None)
     cmd = [sys.executable, __file__, "--child", arm]
     proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if proc.returncode != 0:
@@ -325,6 +345,12 @@ def main():
                    help="child mode (internal use)")
     p.add_argument("--list", action="store_true", help="list cases and exit")
     p.add_argument("--out", help="JSON output path (default: nax_g16_perf_<ts>.json)")
+    p.add_argument(
+        "--capture", default=None, metavar="DIR",
+        help=("If set, run one capture iteration per case and write "
+              "<arm>__<kernel>__<shape>.gputrace files to DIR. The "
+              "regular timing loop still runs after the capture. "
+              "Pass an existing directory; this script does not create it."))
     args = p.parse_args()
 
     if args.list:
@@ -337,9 +363,9 @@ def main():
 
     # Orchestrator
     print("running NAX-on arm ...", flush=True)
-    on_header, on_recs = run_child("on", disable_nax=False)
+    on_header, on_recs = run_child("on", disable_nax=False, capture_dir=args.capture)
     print("running NAX-off arm ...", flush=True)
-    off_header, off_recs = run_child("off", disable_nax=True)
+    off_header, off_recs = run_child("off", disable_nax=True, capture_dir=args.capture)
     preflight(on_header, off_header)
     rows = join(on_recs, off_recs)
     annotate_tflops(rows, all_cases())
