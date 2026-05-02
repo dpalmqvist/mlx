@@ -722,12 +722,22 @@ struct NAXFrag32 {
     // types, since each branch returns a distinct type.
     if constexpr (role == Role::Right) {
       auto ct = op.template get_right_input_cooperative_tensor<T, T, T>();
+#if MLX_NAX_DIAG_VARIANT != 2
       ct.load(view);
+#else
+      // V2 zero-load: skip ct.load. Touch one element of src to keep the
+      // device read alive and prevent DCE. ct stays default-init.
+      volatile auto _v2_sink = static_cast<U>(*src); (void)_v2_sink;
+#endif
       STEEL_PRAGMA_UNROLL
       for (short i = 0; i < kElemsPerFrag; i++) dst[i] = static_cast<T>(ct[i]);
     } else {
       auto ct = op.template get_left_input_cooperative_tensor<T, T, T>();
+#if MLX_NAX_DIAG_VARIANT != 2
       ct.load(view);
+#else
+      volatile auto _v2_sink = static_cast<U>(*src); (void)_v2_sink;
+#endif
       STEEL_PRAGMA_UNROLL
       for (short i = 0; i < kElemsPerFrag; i++) dst[i] = static_cast<T>(ct[i]);
     }
@@ -787,12 +797,22 @@ struct NAXFrag32 {
 
     if constexpr (role == Role::Right) {
       auto ct = op.template get_right_input_cooperative_tensor<U, U, U>();
+#if MLX_NAX_DIAG_VARIANT != 2
       ct.load(view);
+#else
+      // V2 zero-load: skip ct.load. Touch one element of src to keep the
+      // device read alive and prevent DCE. ct stays default-init.
+      volatile auto _v2_sink = static_cast<U>(*src); (void)_v2_sink;
+#endif
       STEEL_PRAGMA_UNROLL
       for (short i = 0; i < kElemsPerFrag; i++) dst[i] = static_cast<T>(ct[i]);
     } else {
       auto ct = op.template get_left_input_cooperative_tensor<U, U, U>();
+#if MLX_NAX_DIAG_VARIANT != 2
       ct.load(view);
+#else
+      volatile auto _v2_sink = static_cast<U>(*src); (void)_v2_sink;
+#endif
       STEEL_PRAGMA_UNROLL
       for (short i = 0; i < kElemsPerFrag; i++) dst[i] = static_cast<T>(ct[i]);
     }
