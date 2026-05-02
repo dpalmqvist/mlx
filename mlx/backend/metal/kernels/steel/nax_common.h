@@ -18,6 +18,19 @@
 
 using namespace metal;
 
+// Phase 9 diagnostic variant selection. 0 = baseline (ship). 1 = no-mma,
+// keeps loads + setup but skips gemm_op.run(). 2 = zero-load, skips
+// ct.load(view) so coop tensors stay default-initialized. 3 = hoisted-op,
+// constructs gemm_op + cooperative tensors once per (mm, nn) outside the
+// K-loop in tile_matmad_nax. See:
+//   docs/superpowers/specs/2026-05-02-nax-g16-phase9-design.md
+//
+// All non-baseline values produce incorrect output and are for benching
+// only. Reset to 0 before shipping.
+#ifndef MLX_NAX_DIAG_VARIANT
+#define MLX_NAX_DIAG_VARIANT 0
+#endif
+
 ///////////////////////////////////////////////////////////////////////////////
 // MMA helper
 ///////////////////////////////////////////////////////////////////////////////
