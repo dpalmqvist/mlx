@@ -22,15 +22,19 @@ This trades *understanding* (we don't know exactly why each prototype helped or 
 
 Replace `threadgroup_barrier` with `simdgroup_barrier` in NAXFrag32's five scratch-staging methods (load_safe, load_rows, store_safe, store_rows, store_slice). Each simdgroup operates on its own scratch slice, so cross-simdgroup ordering is unnecessary.
 
-Commit: `ae02566c`. Bench output: `2026-05-02-nax-g16-phase8-c-postfix-bench.txt`.
+Commit: `ae02566c`. Re-benched in the ship-state measurement (after B and A' reverts) at the merged-branch HEAD. The ship-state numbers are the canonical reference for what merging this PR delivers.
 
-| Case | baseline | post-C | delta |
+Bench artifacts: `2026-05-02-nax-g16-phase8-ship-bench.txt` (canonical, ship-state HEAD) and `2026-05-02-nax-g16-phase8-c-postfix-bench.txt` (original Round 1, on `ae02566c` directly — within measurement noise of ship-state).
+
+| Case | baseline | post-C (ship) | delta |
 |---|---|---|---|
-| gemm_splitk M=64 N=64 K=8192 (target) | 0.36 | 0.38 | +0.02 |
-| All other matmul | — | — | within ±0.05 |
-| sdpa hd=64 kL=2048 | 0.84 | 0.78 | -0.06 (thermal noise — Round 3 confirms) |
+| gemm_splitk M=64 N=64 K=8192 (target) | 0.36 | 0.41 | +0.05 |
+| gemm_splitk M=128 N=128 K=4096 | 0.57 | 0.67 | +0.10 |
+| gemm_segmented B=32 M=128 N=128 K=128 | 0.80 | 0.77 | -0.03 |
+| All other matmul | — | — | within ±0.02 |
+| sdpa, gather | — | — | within ±0.01 (noise) |
 
-Acceptance bar at splitk: FAIL (0.38 < 0.95). But locally clean and bench-neutral elsewhere — kept as a code-quality improvement.
+Acceptance bar at splitk: FAIL (0.41 < 0.95). But the bench is net-positive — small wins on the two splitk shapes, no case regresses by more than 0.03, and `nax_on` absolute times are within 2% of baseline (no occupancy regression). C ships as a code-quality improvement that delivers a measurable but well-below-target speedup at the small-tile splitk shapes.
 
 ### Round 2 — Prototype B (double-buffered scratch in gemm_loop)
 
@@ -78,7 +82,7 @@ The apparent SDPA wins (e.g., kL=2048 hd=128 going 0.45 → 1.42) were `nax_off`
 `nax-g16-phase8` ships:
 - The `--capture` flag in the perf-bench harness (Task 1, commit `ffee6c1c`)
 - Prototype C: simdgroup_barrier scope reduction in NAXFrag32 (commit `ae02566c`)
-- This profiling report and the three bench artifacts
+- This profiling report and four bench artifacts (Rounds 1–3 plus the ship-state confirmation bench)
 - A Phase 9 spec stub
 
 ## Implications for Phase 9
